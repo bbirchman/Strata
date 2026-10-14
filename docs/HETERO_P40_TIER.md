@@ -32,21 +32,20 @@ validates correctness only, not production throughput: the C++ path must
 batch (`copy_blobs`) and use shared memory / pinned rows instead of one
 Python round trip per blob.
 
-## C++ plan (not yet written)
+## C++ tier (written, NOT yet compiled - no toolchain on this box)
 
-- New CUDA daemon (own build, `STRATA_ENABLE_CUDA=ON
-  -DSTRATA_EXPERIMENTAL_SM60=ON`): opens the pack, holds an ExpertCache on
-  the P40, serves blobs over the socket. Storage-only `cudaMemcpy`, no
-  sm_61 kernels.
-- New `RemoteVendorSource : ExpertSource` in the HIP engine: `copy_blobs`
-  fetches from the daemon into pinned rows; `prefetch`/`warm` batch ahead;
-  `pinned()` false until SHM aliasing exists. Never in the default path:
-  gated behind one opt-in flag (name TBD, e.g. `--p40-tier SOCK`).
-- `ExpertDispatch` already carries `remote[3]` CUDA tiers; this tier is a
-  *source* fallback (after RAM, before file), not a compute tier, so it
-  plugs into the FileExpertSource fallback chain, not `RemoteExperts`.
-- Backend guard stays: two processes, one runtime each. No change to
-  `CMakeLists.txt` mutual exclusion.
+- `include/strata/core/vendor_tier.hpp` + `src/core/vendor_tier.cpp`
+  (wired into `strata_engine` in CMakeLists.txt): `VendorTierSource :
+  ExpertSource` decorator. `copy_blob`/`copy_blobs` try the daemon first
+  (sha256-verified, size-checked against `expert_layout().blob_bytes`),
+  fall back per pair to the wrapped source; `blob()` stays on inner_
+  (synchronous contract); `prefetch`/`warm` hint both; `pinned()` false
+  (no SHM alias yet - bytes arrive by copy). Fail-open: any transport
+  error only costs speed. Backend-neutral, Linux-gated with a stub
+  elsewhere. One lock guards the socket (prompt stager is multi-threaded).
+- Still to write: the CUDA daemon, the `--p40-tier SOCK` flag plumbing in
+  `generate.cpp` (wrap `srcp` after the file/arena selection at
+  ~line 5033), real pack-blob addressing in the daemon.
 
 ## Verification plan (per AGENTS.md)
 
