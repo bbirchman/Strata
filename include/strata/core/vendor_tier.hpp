@@ -71,6 +71,14 @@ public:
     // file-mode delegates), copy_blob(s) try the daemon then fall back per
     // pair, prefetch/warm hint both daemon and inner.
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    // Prefill fills and swap-ins read through blob_stable (the mapping-aware
+    // path), not blob: without this override the tier watches a road nothing
+    // drives (0 GETs across whole XXS sessions proved it). Same daemon-first
+    // logic as blob(); staging slots are stream-guarded by note_async_read,
+    // so a recycled slot is never handed out while a DMA still reads it.
+    // Callers that copy immediately (fills, stagers) are unaffected by
+    // recycling; long holders are covered by the busy guard.
+    const uint8_t* blob_stable(int64_t layer, int64_t expert) override { return blob(layer, expert); }
     void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
