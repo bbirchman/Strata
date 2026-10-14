@@ -150,6 +150,14 @@ long long trace_next() {
     return __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
 }
 constexpr long long kTraceCap = 500;
+// Decision tracing (STRATA_P40_TRACE=1, first 20): which branch each blob()
+// takes. Wire tracing above only fires when a GET is sent; silence there
+// cannot tell "never called" from "always delegated".
+void trace_decision(const char* what, int64_t layer, int64_t expert, const char* why) {
+    if (trace_on() && trace_next() < 20)
+        std::fprintf(stderr, "p40tier: %s (%lld,%lld) -> %s\n", what, (long long) layer,
+                     (long long) expert, why);
+}
 void put_u32(std::vector<uint8_t>& v, uint32_t x) {
     v.push_back((uint8_t) x); v.push_back((uint8_t) (x >> 8));
     v.push_back((uint8_t) (x >> 16)); v.push_back((uint8_t) (x >> 24));
@@ -362,19 +370,32 @@ const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
     // File-backed daemon (or no staging): the inner source is already the
     // fastest path, so delegate. The daemon-first path below only pays when
     // the daemon holds a VRAM cache the host does not have.
-    if (fd_ < 0 || vram_cached_ == 0 || staging_.empty() || staging_bytes_ == 0)
+    if (fd_ < 0) {
+        trace_decision("blob", layer, expert, "delegate: no daemon");
         return inner_->blob(layer, expert);
-    if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_)
+    }
+    if (vram_cached_ == 0 || staging_.empty() || staging_bytes_ == 0) {
+        trace_decision("blob", layer, expert, "delegate: file-mode/no-staging");
         return inner_->blob(layer, expert);
+    }
+    if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_) {
+        trace_decision("blob", layer, expert, "delegate: out of range");
+        return inner_->blob(layer, expert);
+    }
     uint64_t want = 0;
     try {
         want = strata::kernels::cpu::expert_layout().blob_bytes(layer);
     } catch (...) { return inner_->blob(layer, expert); }
-    if (want == 0 || want > staging_bytes_) return inner_->blob(layer, expert);
-    if (!daemon_holds(layer, expert)) {
-        __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+    if (want == 0 || want > staging_bytes_) {
+        trace_decision("blob", layer, expert, "delegate: bad size");
         return inner_->blob(layer, expert);
     }
+    if (!daemon_holds(layer, expert)) {
+        __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+        trace_decision("blob", layer, expert, "delegate: bitset-unheld");
+        return inner_->blob(layer, expert);
+    }
+    trace_decision("blob", layer, expert, "daemon-first");
     for (size_t n = 0; n < staging_.size(); ++n) {
         size_t i = (staging_next_ + n) % staging_.size();
         StagingSlot& s = staging_[i];
