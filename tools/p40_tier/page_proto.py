@@ -131,7 +131,7 @@ class _Handler(BaseRequestHandler):
                     if ver != VERSION:
                         self.request.sendall(encode_frame(ERROR, b"version"))
                         return
-                    reply = struct.pack("<IQQQ", VERSION, BLOB_BYTES, store.layers, store.experts)
+                    reply = struct.pack("<IQQQQ", VERSION, BLOB_BYTES, store.layers, store.experts, 0)
                     self.request.sendall(encode_frame(HELLO_REPLY, reply))
                 elif op == GET:
                     layer, expert = struct.unpack("<QQ", payload[:16])
@@ -180,7 +180,8 @@ class PageClient:
         op, reply = decode_frame(self.f)
         if op != HELLO_REPLY:
             raise ConnectionError(f"expected HELLO_REPLY, got op {op}")
-        ver, self.blob_bytes, self.layers, self.experts = struct.unpack("<IQQQ", reply)
+        ver, self.blob_bytes, self.layers, self.experts = struct.unpack("<IQQQ", reply[:28])
+        self.vram_cached = struct.unpack("<Q", reply[28:36])[0] if len(reply) >= 36 else 0
         if ver != VERSION:
             raise ConnectionError(f"server version {ver} != {VERSION}")
 

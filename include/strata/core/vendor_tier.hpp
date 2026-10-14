@@ -43,12 +43,17 @@ public:
     /// The wrapped source (null when closed): mode checks compare against
     /// this, so a wrapped arena still counts as the arena.
     ExpertSource* inner() const { return inner_; }
+    /// Whether the daemon holds a VRAM cache (HELLO_REPLY field 5 > 0):
+    /// only then does blob() fetch daemon-first (a file-backed daemon is
+    /// no faster than the inner source, so blob() delegates to it).
+    bool vram_backed() const { return vram_cached_ > 0; }
 
     // ExpertSource: batched paths go to the daemon first, then inner_.
     // blob()/blob_stable() stay on inner_ (the synchronous contract cannot
     // hide a socket round trip; the daemon feeds the batched paths and the
     // prefetch hints, which is where the file tier's misses come from).
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
                     uint8_t* const* dst, size_t n) override;
@@ -68,9 +73,28 @@ private:
     // matching sha256; false on MISS or any transport error (caller falls
     // back to inner_). Never throws.
     bool fetch_one(int64_t layer, int64_t expert, uint8_t* dst) noexcept;
+    // fetch_one with mu_ already held (blob() holds it across slot scan +
+    // fetch so two threads can never share a staging slot).
+    bool fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept;
 
     int fd_ = -1;
     ExpertSource* inner_ = nullptr;
+    // blob() daemon path: rotating staging slots (the contract keeps every
+    // handed-out pointer valid, and the pool can hold several while it
+    // computes). note_async_read() marks a slot busy; a slot is reused only
+    // when free or its stream reports done, else the call falls back to
+    // inner_ (never blocks, never recycles a live read).
+    struct StagingSlot {
+        uint8_t* ptr = nullptr;
+        bool busy = false;
+        void* stream = nullptr;
+    };
+    static constexpr size_t kStagingSlots = 64;
+    std::vector<StagingSlot> staging_;
+    uint64_t staging_bytes_ = 0;  ///< per-slot bytes (layout max_blob)
+    size_t staging_next_ = 0;
+    uint64_t vram_cached_ = 0;  ///< daemon VRAM bytes (HELLO_REPLY field 5)
+    void note_async_read(const uint8_t* blob, void* stream) override;
     // The socket is one stream: all send/recv sequences take mu_ so two
     // calling threads can never interleave frames (copy_blobs runs on the
     // prompt stager's threads).

@@ -19,6 +19,9 @@ static_assert(strata::core::pagewire::kMagic == 0x50343054, "page protocol magic
 static_assert(strata::core::pagewire::kVersion == 1, "page protocol version");
 static_assert(strata::core::pagewire::kMaxPayload == (8ull << 20), "page max payload");
 static_assert((uint32_t) strata::core::pagewire::Op::BYE == 10, "page op numbering");
+// cudaStream_t for the note_async_read stream queries below. Every other
+// core TU already includes this (it resolves to HIP in HIP builds).
+#include <cuda_runtime.h>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -28,6 +31,7 @@ static_assert((uint32_t) strata::core::pagewire::Op::BYE == 10, "page op numberi
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
@@ -226,12 +230,42 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
         err = "vendor tier: version/blob mismatch";
         return false;
     }
-    (void) layers; (void) experts; (void) nl; (void) ne;
+    (void) layers;
+    (void) experts;
+    (void) nl;
+    (void) ne;
+    // HELLO_REPLY field 5 (optional, v1.1): the daemon's VRAM-cached bytes.
+    // Absent (older/file-mode daemons, Python fixture) reads 0 and blob()
+    // delegates to the inner source.
+    uint64_t vc = 0;
+    if (reply.size() >= 36) std::memcpy(&vc, reply.data() + 28, 8);
     fd_ = fd;
     inner_ = inner;
     blob_bytes_ = bb;
     layers_ = (int64_t) nl;
     experts_ = (int64_t) ne;
+    vram_cached_ = vc;
+    staging_.clear();
+    staging_bytes_ = 0;
+    staging_next_ = 0;
+    if (vc > 0) {
+        uint64_t mb = 0;
+        try {
+            mb = strata::kernels::cpu::expert_layout().max_blob;
+        } catch (...) { mb = 0; }
+        if (mb > 0 && mb <= kMaxPayload) {
+            staging_.resize(kStagingSlots);
+            for (auto& s : staging_) {
+                s.ptr = (uint8_t*) std::malloc((size_t) mb);
+                if (s.ptr == nullptr) {
+                    for (auto& t : staging_) std::free(t.ptr);
+                    staging_.clear();
+                    break;
+                }
+            }
+            if (!staging_.empty()) staging_bytes_ = mb;
+        }
+    }
     return true;
 }
 
@@ -243,16 +277,68 @@ void VendorTierSource::close() {
         ::close(fd_);
         fd_ = -1;
     }
+    for (auto& s : staging_) std::free(s.ptr);
+    staging_.clear();
+    staging_bytes_ = 0;
+    staging_next_ = 0;
+    vram_cached_ = 0;
     inner_ = nullptr;
 }
 
 const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
     if (inner_ == nullptr) return nullptr;
+    std::lock_guard<std::mutex> lock(mu_);
+    // File-backed daemon (or no staging): the inner source is already the
+    // fastest path, so delegate. The daemon-first path below only pays when
+    // the daemon holds a VRAM cache the host does not have.
+    if (fd_ < 0 || vram_cached_ == 0 || staging_.empty() || staging_bytes_ == 0)
+        return inner_->blob(layer, expert);
+    if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_)
+        return inner_->blob(layer, expert);
+    uint64_t want = 0;
+    try {
+        want = strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    } catch (...) { return inner_->blob(layer, expert); }
+    if (want == 0 || want > staging_bytes_) return inner_->blob(layer, expert);
+    for (size_t n = 0; n < staging_.size(); ++n) {
+        size_t i = (staging_next_ + n) % staging_.size();
+        StagingSlot& s = staging_[i];
+        if (s.busy) {
+            // Reuse only when the stream reports done; anything else
+            // (not-ready or an error) keeps the slot busy. No blocking.
+            if (s.stream == nullptr) continue;
+            if (::cudaStreamQuery((cudaStream_t) s.stream) != cudaSuccess) continue;
+            (void) ::cudaGetLastError();  // clear a sticky query error, if any
+            s.busy = false;
+            s.stream = nullptr;
+        }
+        if (fetch_one_locked(layer, expert, s.ptr)) {
+            staging_next_ = (i + 1) % staging_.size();
+            return s.ptr;
+        }
+        return inner_->blob(layer, expert);
+    }
     return inner_->blob(layer, expert);
+}
+
+void VendorTierSource::note_async_read(const uint8_t* blob, void* stream) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto& s : staging_) {
+        if (s.ptr != nullptr && blob >= s.ptr && blob < s.ptr + staging_bytes_) {
+            s.busy = true;
+            s.stream = stream;
+            return;
+        }
+    }
+    if (inner_ != nullptr) inner_->note_async_read(blob, stream);
 }
 
 bool VendorTierSource::fetch_one(int64_t layer, int64_t expert, uint8_t* dst) noexcept {
     std::lock_guard<std::mutex> lock(mu_);
+    return fetch_one_locked(layer, expert, dst);
+}
+
+bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept {
     if (fd_ < 0 || inner_ == nullptr) return false;
     if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_) return false;
     // Engine-side size for this pair (native packs vary per layer).

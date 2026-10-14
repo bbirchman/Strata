@@ -323,6 +323,7 @@ int main(int argc, char** argv) {
                 pu64(max_blob);
                 pu64((uint64_t) nl);
                 pu64((uint64_t) ne);
+                pu64(used);  // HELLO_REPLY field 5: VRAM-cached bytes (0 = file mode)
                 if (!send_frame(fd, (uint32_t) pw::HELLO_REPLY, rep.data(), rep.size())) break;
             } else if (op == pw::GET) {
                 ++gets;
