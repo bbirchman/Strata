@@ -1,15 +1,19 @@
 // include/strata/core/vendor_tier.hpp - het-p40-tier: a P40 VRAM expert tier
-// behind a Unix socket, as an ExpertSource decorator.
+// behind a Unix socket, as a FileExpertSource SUBCLASS.
 //
-// A VendorTierSource wraps another source (the file tier or the arena) and
-// serves copy_blob/copy_blobs from a CUDA daemon holding blobs in P40 VRAM.
-// Anything the daemon cannot serve - a MISS, a socket error, a hash mismatch
-// - falls back to the wrapped source, so the tier is advisory: with the flag
-// off nothing changes (byte-identical default), with it on a failure only
-// costs speed, never correctness.
+// Why subclass, not wrapper: generate.cpp drives the concrete FileExpertSource
+// object for all bulk movement (resident copies, prefill staging, mapped
+// reads); a pure ExpertSource wrapper only sees the abstract srcp paths the
+// file modes barely use (0 GETs across whole XXS sessions proved it). As a
+// subclass substituted for the single `src` local, every existing call site
+// (concrete methods, &src comparisons, FileExpertSource& params) keeps
+// working untouched: flag off, every override delegates to the base and the
+// default path is byte-identical by construction.
 //
-// Backend-neutral on purpose: no cuda_runtime.h here (unlike
-// remote_experts.hpp, which is CUDA-only). The HIP engine links this file
+// Two modes: (a) self mode (file/mmap/budget): inner_ is null and fallbacks
+// call the base implementation - the object IS the file tier plus a daemon;
+// (b) arena-wrap mode: set_inner(&arena_src) and fallbacks call inner_.
+// Backend-neutral: no cuda_runtime.h here. The HIP engine links this file
 // unchanged; the CUDA daemon is a separate process and build.
 #pragma once
 
@@ -26,18 +30,24 @@ namespace strata::core {
 // [u32 magic 0x50343054][u32 op][u64 len][payload], little-endian.
 // Ops: HELLO=1, HELLO_REPLY=2, GET=3, BLOB=4, MISS=5, PREFETCH=6, ACK=7,
 // STATS=8, STATS_REPLY=9, BYE=10, ERROR=11.
-class VendorTierSource : public ExpertSource {
+class VendorTierSource : public FileExpertSource {
 public:
     VendorTierSource() = default;
     ~VendorTierSource() override;
     VendorTierSource(const VendorTierSource&) = delete;
     VendorTierSource& operator=(const VendorTierSource&) = delete;
 
-    /// Connect to the daemon at `socket_path` and wrap `inner` (not owned).
-    /// False with `err` when the daemon cannot be reached: the caller keeps
-    /// the inner source and runs without the tier.
+    /// Arena-wrap mode: connect to the daemon at `socket_path` and fall back
+    /// to `inner` (not owned). False with `err` when the daemon cannot be
+    /// reached: the caller keeps the selected source and runs tierless.
     bool open(const std::string& socket_path, ExpertSource* inner,
               int64_t layers, int64_t experts, std::string& err);
+    /// Self mode (file/mmap/budget): the base part is already open as the
+    /// file tier; connect the daemon for it. Same fail-open contract.
+    bool open_tier(const std::string& socket_path, int64_t layers, int64_t experts,
+                   std::string& err);
+    /// Arena-wrap target (not owned). Null (default) = self mode.
+    void set_inner(ExpertSource* inner) { inner_ = inner; }
     void close();
     bool valid() const { return fd_ >= 0; }
     /// The wrapped source (null when closed): mode checks compare against
@@ -85,9 +95,36 @@ private:
     // fetch_one with mu_ already held (blob() holds it across slot scan +
     // fetch so two threads can never share a staging slot).
     bool fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept;
+    // Shared dial+HELLO+staging body behind open() and open_tier().
+    bool connect_daemon(const std::string& socket_path, int64_t layers, int64_t experts,
+                        std::string& err);
 
     int fd_ = -1;
-    ExpertSource* inner_ = nullptr;
+    ExpertSource* inner_ = nullptr;  ///< arena-wrap target; null = self mode
+    // Fallbacks: arena-wrap mode calls inner_, self mode calls the base
+    // implementation (qualified calls: no virtual redispatch, no recursion).
+    const uint8_t* fb_blob(int64_t l, int64_t e) {
+        return inner_ != nullptr ? inner_->blob(l, e) : FileExpertSource::blob(l, e);
+    }
+    bool fb_copy_blob(int64_t l, int64_t e, uint8_t* dst) {
+        return inner_ != nullptr ? inner_->copy_blob(l, e, dst)
+                                 : FileExpertSource::copy_blob(l, e, dst);
+    }
+    void fb_prefetch(int64_t l, const int64_t* e, int64_t n) {
+        if (inner_ != nullptr) inner_->prefetch(l, e, n);
+        else FileExpertSource::prefetch(l, e, n);
+    }
+    void fb_warm(int64_t l, const int64_t* e, int64_t n) {
+        if (inner_ != nullptr) inner_->warm(l, e, n);
+        else FileExpertSource::warm(l, e, n);
+    }
+    void fb_note(const uint8_t* b, void* s) {
+        if (inner_ != nullptr) inner_->note_async_read(b, s);
+        else FileExpertSource::note_async_read(b, s);
+    }
+    int64_t fb_reads() const {
+        return (inner_ != nullptr ? inner_->reads() : FileExpertSource::reads());
+    }
     // blob() daemon path: rotating staging slots (the contract keeps every
     // handed-out pointer valid, and the pool can hold several while it
     // computes). note_async_read() marks a slot busy; a slot is reused only

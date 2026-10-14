@@ -174,6 +174,21 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
                             int64_t layers, int64_t experts, std::string& err) {
     close();
     if (inner == nullptr) { err = "vendor tier: null inner source"; return false; }
+    inner_ = inner;
+    return connect_daemon(socket_path, layers, experts, err);
+}
+
+bool VendorTierSource::open_tier(const std::string& socket_path, int64_t layers, int64_t experts,
+                                 std::string& err) {
+    // Self mode: the base part is already open as the file tier (generate.cpp
+    // opened it); only the daemon side is (re)connected here. close() only
+    // resets tier state (inner_ is already null), never the file mapping.
+    close();
+    return connect_daemon(socket_path, layers, experts, err);
+}
+
+bool VendorTierSource::connect_daemon(const std::string& socket_path, int64_t layers, int64_t experts,
+                                      std::string& err) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { err = "vendor tier: socket() failed"; return false; }
     // Non-blocking connect with a 3 s deadline: a missing daemon must fail
@@ -282,7 +297,6 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
                  (unsigned long long) nl, (unsigned long long) ne, (double) vc / 1073741824.0,
                  held.size(), held.empty() ? "absent: asking daemon for everything" : "parsed");
     fd_ = fd;
-    inner_ = inner;
     blob_bytes_ = bb;
     layers_ = (int64_t) nl;
     experts_ = (int64_t) ne;
@@ -336,7 +350,7 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
                 if (want == 0 || want > staging_bytes_) continue;
                 std::vector<uint8_t> a((size_t) want), b((size_t) want);
                 if (!fetch_one(l, (int32_t) e, a.data())) continue;
-                if (inner_ == nullptr || !inner_->copy_blob(l, (int32_t) e, b.data())) continue;
+                if (!fb_copy_blob(l, (int32_t) e, b.data())) continue;
                 ++checked;
                 if (std::memcmp(a.data(), b.data(), (size_t) want) == 0) ++matched;
             }
@@ -365,35 +379,34 @@ void VendorTierSource::close() {
 }
 
 const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
-    if (inner_ == nullptr) return nullptr;
     std::lock_guard<std::mutex> lock(mu_);
     // File-backed daemon (or no staging): the inner source is already the
     // fastest path, so delegate. The daemon-first path below only pays when
     // the daemon holds a VRAM cache the host does not have.
     if (fd_ < 0) {
         trace_decision("blob", layer, expert, "delegate: no daemon");
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
     if (vram_cached_ == 0 || staging_.empty() || staging_bytes_ == 0) {
         trace_decision("blob", layer, expert, "delegate: file-mode/no-staging");
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
     if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_) {
         trace_decision("blob", layer, expert, "delegate: out of range");
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
     uint64_t want = 0;
     try {
         want = strata::kernels::cpu::expert_layout().blob_bytes(layer);
-    } catch (...) { return inner_->blob(layer, expert); }
+    } catch (...) { return fb_blob(layer, expert); }
     if (want == 0 || want > staging_bytes_) {
         trace_decision("blob", layer, expert, "delegate: bad size");
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
     if (!daemon_holds(layer, expert)) {
         __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
         trace_decision("blob", layer, expert, "delegate: bitset-unheld");
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
     trace_decision("blob", layer, expert, "daemon-first");
     for (size_t n = 0; n < staging_.size(); ++n) {
@@ -412,9 +425,9 @@ const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
             staging_next_ = (i + 1) % staging_.size();
             return s.ptr;
         }
-        return inner_->blob(layer, expert);
+        return fb_blob(layer, expert);
     }
-    return inner_->blob(layer, expert);
+    return fb_blob(layer, expert);
 }
 
 void VendorTierSource::note_async_read(const uint8_t* blob, void* stream) {
@@ -426,7 +439,7 @@ void VendorTierSource::note_async_read(const uint8_t* blob, void* stream) {
             return;
         }
     }
-    if (inner_ != nullptr) inner_->note_async_read(blob, stream);
+    fb_note(blob, stream);
 }
 
 bool VendorTierSource::fetch_one(int64_t layer, int64_t expert, uint8_t* dst) noexcept {
@@ -435,7 +448,7 @@ bool VendorTierSource::fetch_one(int64_t layer, int64_t expert, uint8_t* dst) no
 }
 
 bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept {
-    if (fd_ < 0 || inner_ == nullptr) return false;
+    if (fd_ < 0) return false;
     if (!daemon_holds(layer, expert)) {
         __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
         return false;
@@ -516,9 +529,8 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
 
 bool VendorTierSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (fetch_one(layer, expert, dst)) return true;
-    if (inner_ == nullptr) return false;
     const auto& pl = strata::kernels::cpu::expert_layout();
-    bool ok = inner_->copy_blob(layer, expert, dst);
+    bool ok = fb_copy_blob(layer, expert, dst);
     if (ok) __atomic_fetch_add(&tier_fallback_bytes_, (long long) pl.blob_bytes(layer), __ATOMIC_RELAXED);
     return ok;
 }
@@ -540,7 +552,7 @@ void VendorTierSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
     // demand) or not (MISS). Forward to inner_ only, so the hot path pays
     // zero socket round trips here (a PREFETCH+ACK per layer per token
     // measured as pure overhead: 9.8 -> 6.4 tok/s with zero GETs served).
-    if (inner_ != nullptr) inner_->prefetch(layer, experts, n);
+    fb_prefetch(layer, experts, n);
 }
 
 void VendorTierSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
@@ -548,12 +560,11 @@ void VendorTierSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
     // FileExpertSource treats warm (page advice) and prefetch (reads)
     // separately: the tier hints reads via prefetch(), but the inner source
     // still needs its own page advice for whatever the daemon misses.
-    if (inner_ != nullptr) inner_->warm(layer, experts, n);
+    fb_warm(layer, experts, n);
 }
 
 int64_t VendorTierSource::reads() const {
-    int64_t inner_reads = inner_ != nullptr ? inner_->reads() : 0;
-    return reads_ + inner_reads;
+    return reads_ + fb_reads();
 }
 
 }  // namespace strata::core

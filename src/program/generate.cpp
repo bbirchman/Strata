@@ -4749,7 +4749,7 @@ int main(int argc, char** argv) {
     // The earlier "the arena does not fit" conclusion was WRONG and is worth recording: the failure was a stale
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
-    strata::core::FileExpertSource src;
+    strata::core::VendorTierSource src;
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -5043,13 +5043,23 @@ int main(int argc, char** argv) {
         srcp = &arena_src;
     }
     if (!o.p40_tier.empty() && srcp != nullptr) {
-        // het-p40-tier (opt-in): wrap the selected source (file or arena)
-        // with the P40 daemon tier. Fail-open: a refused daemon only warns
-        // and the run continues on the selected source, byte-identical.
+        // het-p40-tier (opt-in): file modes (mmap/budget/resident-file) turn
+        // the file object itself into the tier (it IS-A FileExpertSource, so
+        // every concrete call site keeps working); arena mode wraps as before.
+        // Fail-open either way: a refused daemon only warns and the run
+        // continues on the selected source, byte-identical.
         // srcp_mode is the UNWRAPPED identity for every mode check below
         // (arena vs file): the data path uses srcp (the tier).
         std::string tier_err;
-        if (p40_src.open(o.p40_tier, srcp, g.n_layers, g.n_expert, tier_err)) {
+        if (srcp == &src) {
+            if (src.open_tier(o.p40_tier, g.n_layers, g.n_expert, tier_err)) {
+                std::fprintf(stderr, "strata generate: --p40-tier %s: daemon connected, file tier on\n",
+                             o.p40_tier.c_str());
+            } else {
+                std::fprintf(stderr, "strata generate: WARNING: --p40-tier %s: %s; continuing without the tier\n",
+                             o.p40_tier.c_str(), tier_err.c_str());
+            }
+        } else if (p40_src.open(o.p40_tier, srcp, g.n_layers, g.n_expert, tier_err)) {
             srcp = &p40_src;
             std::fprintf(stderr, "strata generate: --p40-tier %s: daemon connected, tier on\n",
                          o.p40_tier.c_str());
