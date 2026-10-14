@@ -58,6 +58,28 @@ Python round trip per blob.
 - Build every backend touched (CUDA daemon, HIP engine) before review.
 - Numbers reported with what they were measured on (GPUs, RAM, NVMe).
 
+## Daemon (written, NOT yet compiled - no toolchain on this box)
+
+- `src/p40d/p40_daemon.cpp` -> target `p40_daemon` (CUDA builds only).
+  Reuses `FileExpertSource::open` for byte-identical addressing, reads the
+  STRP `--expert-profile` ranking, pre-copies the coldest tail fitting
+  `--vram-gib` into P40 VRAM (plain `cudaMalloc`, storage only), serves
+  protocol v1. `--vram-gib 0` = file-backed truth mode (validates real
+  bytes, no capacity gain).
+- Shared framing/SHA: `include/strata/core/page_wire.hpp` (daemon's single
+  source of truth); `vendor_tier.cpp` keeps a local copy with
+  static_asserts against it (merge follow-up, not correctness).
+- Build (separate dir from the HIP engine):
+  `cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF
+  -DCMAKE_CUDA_ARCHITECTURES=61 -DSTRATA_EXPERIMENTAL_SM60=ON &&
+  cmake --build build-cuda --target p40_daemon -j$(nproc)`
+  (needs the CUDA 12.9 toolkit; CUDA 13 dropped sm_61).
+- Run: `CUDA_VISIBLE_DEVICES=<p40> ./build-cuda/p40_daemon --pack
+  <model-dir> --profile <profile.bin> --socket /tmp/p40.sock --vram-gib
+  20 [--gguf <native-shard>]`, then the engine with
+  `--p40-tier /tmp/p40.sock` (llama-swap stopped first, rung 0).
+
 ## Validation ladder (user PC: 7800XT + P40 + 32GB, CachyOS)
 
 0. BEFORE ANY GPU RUN: stop llama-swap - `systemctl stop llama-swap`

@@ -490,6 +490,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/vendor_tier.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # ---- het-p40-tier: the P40 page daemon (storage-only, no kernels) ----
+  # Real CUDA only (not the gfx906 alias layer): it pre-copies blobs into P40
+  # VRAM with cudart and serves them over a Unix socket. Built from a CUDA
+  # configure (e.g. -DCMAKE_CUDA_ARCHITECTURES=61 -DSTRATA_EXPERIMENTAL_SM60=ON
+  # for the P40); never in the HIP engine build.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    add_executable(p40_daemon src/p40d/p40_daemon.cpp)
+    target_include_directories(p40_daemon PRIVATE include)
+    target_link_libraries(p40_daemon PRIVATE strata_engine CUDA::cudart Threads::Threads)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)

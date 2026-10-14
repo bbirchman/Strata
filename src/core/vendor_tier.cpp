@@ -11,6 +11,14 @@
 #if defined(__linux__)
 
 #include "strata/kernels/cpu/expert_layout.hpp"
+// Shared protocol constants (framing ops live locally below; these asserts
+// stop the two copies drifting silently - the daemon includes page_wire.hpp
+// as its single source of truth).
+#include "strata/core/page_wire.hpp"
+static_assert(strata::core::pagewire::kMagic == 0x50343054, "page protocol magic");
+static_assert(strata::core::pagewire::kVersion == 1, "page protocol version");
+static_assert(strata::core::pagewire::kMaxPayload == (8ull << 20), "page max payload");
+static_assert((uint32_t) strata::core::pagewire::Op::BYE == 10, "page op numbering");
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -266,9 +274,11 @@ bool VendorTierSource::fetch_one(int64_t layer, int64_t expert, uint8_t* dst) no
         __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
         return false;
     }
-    if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want || rh.len - 48 != blob_bytes_) {
-        // Size disagreement (different pack geometry): not ours to serve.
-        // Drain the frame so the stream stays in sync, then fall back.
+    if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want) {
+        // Size disagreement (daemon serves a different pack geometry):
+        // not ours to serve. Drain the frame so the stream stays in sync,
+        // then fall back. (Pack identity is the operator's job: the daemon
+        // must open the same --pack as the engine.)
         std::vector<uint8_t> drain;
         drain.resize((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
         if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) return false;
