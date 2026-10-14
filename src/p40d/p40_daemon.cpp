@@ -201,6 +201,13 @@ int main(int argc, char** argv) {
     }
     strata::core::FileExpertSource src;
     if (!a.gguf.empty()) src.set_gguf(a.gguf);
+    // The process-wide layout comes from the pack's index.txt (generate.cpp
+    // does this before opening any source); without it the global still
+    // says canonical 48x512 and a pruned pack (Coder: 256/layer) refuses.
+    if (!strata::kernels::cpu::expert_layout_load(a.pack, nl, ne, err)) {
+        std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
+        return 1;
+    }
     if (!src.open(a.pack, nl, ne, err)) {
         std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
         return 1;
