@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -402,8 +403,18 @@ int main(int argc, char** argv) {
                     ++trace_n;
                 }
                 pw::Sha256 hsh;
-                hsh.update(bytes, (size_t) nb);
-                auto dg = hsh.final();
+                static bool verify = [] {
+                    const char* e = std::getenv("STRATA_P40_VERIFY");
+                    return e != nullptr && e[0] == '1';
+                }();
+                // Content proof moved to open-time sentinels (see tier):
+                // hashing every 2 MB blob here costs more CPU than the PCIe
+                // transfer. Zeros unless both ends opt into VERIFY=1.
+                std::array<uint8_t, 32> dg{};
+                if (verify) {
+                    hsh.update(bytes, (size_t) nb);
+                    dg = hsh.final();
+                }
                 // One frame: len = 48 + nb, payload = meta + bytes, exactly
                 // what VendorTierSource::fetch_one reads (and what the
                 // Python page server sends).

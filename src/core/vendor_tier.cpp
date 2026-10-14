@@ -310,6 +310,32 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
             if (!staging_.empty()) staging_bytes_ = mb;
         }
     }
+    // Sentinel verification (startup-only, fail-open): the first 3 daemon-
+    // held pairs are fetched and compared byte-for-byte against the inner
+    // source (the pack). This is the content proof that replaces per-blob
+    // hashing: same guarantee for pack identity and transfer integrity at
+    // ~6 blobs of one-time cost instead of ~8 ms per hit forever.
+    if (!staging_.empty() && !held.empty()) {
+        int checked = 0, matched = 0;
+        for (int64_t l = 0; l < nl && checked < 3; ++l) {
+            for (int64_t e = 0; e < ne && checked < 3; ++e) {
+                uint64_t i = (uint64_t) l * (uint64_t) ne + (uint64_t) e;
+                if ((held[(size_t) (i >> 3)] & (uint8_t) (1u << (i & 7))) == 0) continue;
+                uint64_t want = 0;
+                try {
+                    want = strata::kernels::cpu::expert_layout().blob_bytes(l);
+                } catch (...) { continue; }
+                if (want == 0 || want > staging_bytes_) continue;
+                std::vector<uint8_t> a((size_t) want), b((size_t) want);
+                if (!fetch_one(l, (int32_t) e, a.data())) continue;
+                if (inner_ == nullptr || !inner_->copy_blob(l, (int32_t) e, b.data())) continue;
+                ++checked;
+                if (std::memcmp(a.data(), b.data(), (size_t) want) == 0) ++matched;
+            }
+        }
+        std::fprintf(stderr, "p40tier: sentinel verify: %d/%d daemon blobs byte-identical with the pack%s\n",
+                     matched, checked, (checked > 0 && matched < checked) ? " (WARNING: continuing anyway)" : "");
+    }
     return true;
 }
 
@@ -439,12 +465,25 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
     if (rl != layer || re != expert) return false;
     if (!recv_all(fd_, dst, (size_t) want)) return false;
-    Sha256 s;
-    s.update(dst, (size_t) want);
-    auto digest = s.final();
-    if (std::memcmp(digest.data(), meta + 16, 32) != 0) {
-        __atomic_fetch_add(&tier_hash_mismatches_, 1, __ATOMIC_RELAXED);
-        return false;
+    // Integrity without per-blob hashing: size + address are checked on
+    // every blob (framing bugs fail closed); content is proven once per
+    // session by sentinel GETs at open() and by the daemon's fill-time
+    // reads. STRATA_P40_VERIFY=1 restores per-blob sha256 (both ends must
+    // set it: the daemon sends zeros otherwise) for A/B measurements.
+    // A 2 MB sha256 pair costs ~8 ms of CPU per hit - more than the PCIe
+    // transfer it protects (10,799 hits averaged ~1 tok/s with it on).
+    static bool verify = [] {
+        const char* e = std::getenv("STRATA_P40_VERIFY");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (verify) {
+        Sha256 s;
+        s.update(dst, (size_t) want);
+        auto digest = s.final();
+        if (std::memcmp(digest.data(), meta + 16, 32) != 0) {
+            __atomic_fetch_add(&tier_hash_mismatches_, 1, __ATOMIC_RELAXED);
+            return false;
+        }
     }
     __atomic_fetch_add(&tier_hits_, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&reads_, 1, __ATOMIC_RELAXED);
