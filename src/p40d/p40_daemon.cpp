@@ -12,14 +12,15 @@
 //                   there; anything else is a MISS the engine reads from
 //                   RAM/file.
 //
-// Build (separate CUDA build dir, NOT the HIP engine dir):
-//   cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
-//     -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF \
+// Build (separate CUDA build dir, NOT the HIP engine dir). Example configure
+// and build lines (fill in your toolkit path as needed):
+//   cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release
+//     -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF
 //     -DCMAKE_CUDA_ARCHITECTURES=61 -DSTRATA_EXPERIMENTAL_SM60=ON
 //   cmake --build build-cuda --target p40_daemon -j$(nproc)
 // Run with the P40 visible only to the daemon:
-//   CUDA_VISIBLE_DEVICES=<p40-index> ./build-cuda/p40_daemon \
-//     --pack <model-dir> --profile <profile.bin> --socket /tmp/p40.sock \
+//   CUDA_VISIBLE_DEVICES=<p40-index> ./build-cuda/p40_daemon
+//     --pack <model-dir> --profile <profile.bin> --socket /tmp/p40.sock
 //     --vram-gib 20 [--gguf <native-shard>] [--device 0]
 //
 // Byte contract: blobs are FileExpertSource::blob_stable() bytes for the
@@ -65,15 +66,6 @@ bool recv_all(int fd, uint8_t* p, size_t n) {
         n -= (size_t) r;
     }
     return true;
-}
-void put_u32(std::vector<uint8_t>& v, uint32_t x) {
-    v.push_back((uint8_t) x);
-    v.push_back((uint8_t) (x >> 8));
-    v.push_back((uint8_t) (x >> 16));
-    v.push_back((uint8_t) (x >> 24));
-}
-void put_u64(std::vector<uint8_t>& v, uint64_t x) {
-    for (int i = 0; i < 8; ++i) v.push_back((uint8_t) (x >> (8 * i)));
 }
 bool send_frame(int fd, uint32_t op, const uint8_t* payload, size_t len) {
     if (len > pw::kMaxPayload) return false;
