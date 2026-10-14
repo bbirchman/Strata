@@ -28,6 +28,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/vendor_tier.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -491,6 +492,11 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
+    /// het-p40-tier (opt-in): Unix socket of the P40 page daemon; empty = off.
+    /// When set, a VendorTierSource wraps the selected source and serves
+    /// copy_blob(s) from P40 VRAM first (sha256-verified), falling back per
+    /// pair to RAM/file. Default output unchanged without it.
+    std::string p40_tier;
     /// The PLE gather's prefetch, as an A/B arm.  The gather measured 2.10-2.61 ms/token because its sixteen
     /// row reads are sixteen SEPARATE page faults into a 26.8 GB mapping; see `ple_prefetch_enable`.
     bool no_ple_prefetch = false;
@@ -893,6 +899,9 @@ void usage() {
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
+                 "  --p40-tier SOCK     het-p40-tier: P40 VRAM as an expert tier after RAM, before file\n"
+                 "                       (Unix socket of the page daemon; storage-only, no P40 kernels).\n"
+                 "                       A refused daemon only warns and the run continues tierless.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -2193,6 +2202,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
+        else if (a == "--p40-tier") o.p40_tier = next("--p40-tier");
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
@@ -4819,6 +4829,7 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::ArenaExpertSource arena_src;
+    strata::core::VendorTierSource p40_src;
     strata::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
@@ -5031,6 +5042,23 @@ int main(int argc, char** argv) {
 #endif
         srcp = &arena_src;
     }
+    if (!o.p40_tier.empty() && srcp != nullptr) {
+        // het-p40-tier (opt-in): wrap the selected source (file or arena)
+        // with the P40 daemon tier. Fail-open: a refused daemon only warns
+        // and the run continues on the selected source, byte-identical.
+        // srcp_mode is the UNWRAPPED identity for every mode check below
+        // (arena vs file): the data path uses srcp (the tier).
+        std::string tier_err;
+        if (p40_src.open(o.p40_tier, srcp, g.n_layers, g.n_expert, tier_err)) {
+            srcp = &p40_src;
+            std::fprintf(stderr, "strata generate: --p40-tier %s: daemon connected, tier on\n",
+                         o.p40_tier.c_str());
+        } else {
+            std::fprintf(stderr, "strata generate: WARNING: --p40-tier %s: %s; continuing without the tier\n",
+                         o.p40_tier.c_str(), tier_err.c_str());
+        }
+    }
+    strata::core::ExpertSource* srcp_mode = srcp == &p40_src ? p40_src.inner() : srcp;
 #if defined(__linux__)
     // 0.1.43.1: on by default (STRATA_ADAPT_CALLBACK_WARMUP=0 turns it off).  Linux threads inherit the creator's CPU mask, and
     // the host pins itself to one CPU later; a callback thread the driver creates lazily after that would run on the
@@ -5809,7 +5837,7 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    if (srcp != nullptr && ((srcp_mode == &src && (src.warms() || srcp == &p40_src)) || fs_ahead || la_stats) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -6982,9 +7010,9 @@ int main(int argc, char** argv) {
         }();
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
-                        : !o.resident_cpu_experts && srcp != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
-                        : multi_gpu && srcp == &arena_src ? "not with a layer split in the arena mode"
-                        : o.pipeline_windows >= 2 && srcp == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
+                        : !o.resident_cpu_experts && srcp_mode != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
+                        : multi_gpu && srcp_mode == &arena_src ? "not with a layer split in the arena mode"
+                        : o.pipeline_windows >= 2 && srcp_mode == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
                         : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
                         : peer.valid() ? "not with --peer-device"
                         : remote_opt ? "not with --remote-expert-opt"
@@ -7184,10 +7212,10 @@ int main(int argc, char** argv) {
 #endif
     }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
-    if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
+    if (o.adapt_async && !src.complement_ready() && srcp_mode != &arena_src) adapt_async_off("the resident RAM mode is not running");
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
     // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
-    if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
+    if (srcp_mode == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
         std::string why;
         const bool dropped = src.drop_mapping(why);
         std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
@@ -7209,7 +7237,7 @@ int main(int argc, char** argv) {
             sm.avail_commit = hm.commit == ~uint64_t{0} ? strata::prefill::share_rules::kUnknown : hm.commit;
         }
         sm.buffer_bytes = (uint64_t) (1024 + 8 * g.n_expert) * (uint64_t) g.n_embd * 4 + (256ull << 20);
-        if (srcp == &src) {
+        if (srcp_mode == &src) {
             const auto& lay = strata::kernels::cpu::expert_layout();
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
@@ -9056,7 +9084,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<JobThread> ajob;
         // the arena mode (srcp == &arena_src): every expert is in the arena already, so a round is a copy in only - no
         // exchange buffers, no RAM moves (see a_arena below)
-        const bool a_arena = srcp == &arena_src;
+        const bool a_arena = srcp_mode == &arena_src;
         // as the blocking tier's exchange buffers; the arena has none, so its rounds are as large as the blocking tier's
         const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96);
         const auto a_env = [](const char* name, int def) {
@@ -13038,11 +13066,16 @@ int main(int argc, char** argv) {
                              (unsigned long long)src.rotated_exchanges(),
                              (unsigned long long)src.avoided_exchange_copy_bytes());
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
-            if (srcp == &src) {
+            if (srcp_mode == &src) {
                 std::fprintf(stderr, "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
                                      "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
                              src.gguf_mode() ? " (the GGUF in place)" : "");
+                if (srcp == &p40_src)
+                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches\n",
+                                 (long long) p40_src.tier_hits(), (long long) p40_src.tier_misses(),
+                                 (double) p40_src.tier_fallback_bytes() / 1e6,
+                                 (long long) p40_src.tier_hash_mismatches());
                 // what the OS did for this request (since the previous one): the drive's share of the file tier's reads
                 // against the page cache's, and what the I/O path did about it
                 static strata::platform::ProcIo io_prev;
@@ -13955,7 +13988,7 @@ int main(int argc, char** argv) {
             std::printf("%-24s %.2f GiB of experts in RAM, %lld exchanged with the VRAM tier, %lld blob reads from "
                         "the file\n", "resident RAM", (double) src.resident_bytes() / 1073741824.0,
                         (long long) src.exchanges(), (long long) src.file_reads());
-        if (srcp == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
+        if (srcp_mode == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
             const double fms = src.file_ms() - fms0, fmb = (double) (src.file_blob_bytes() - fbytes0) / 1e6;
             std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files (%.2f MB/round, "
                         "%.1f ms/round of reading, %.2f GB/s per reading thread)%s; prompt copies %.1f MB\n",

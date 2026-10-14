@@ -40,6 +40,9 @@ public:
               int64_t layers, int64_t experts, std::string& err);
     void close();
     bool valid() const { return fd_ >= 0; }
+    /// The wrapped source (null when closed): mode checks compare against
+    /// this, so a wrapped arena still counts as the arena.
+    ExpertSource* inner() const { return inner_; }
 
     // ExpertSource: batched paths go to the daemon first, then inner_.
     // blob()/blob_stable() stay on inner_ (the synchronous contract cannot
