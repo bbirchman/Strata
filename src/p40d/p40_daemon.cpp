@@ -345,6 +345,18 @@ int main(int argc, char** argv) {
                 pu64((uint64_t) nl);
                 pu64((uint64_t) ne);
                 pu64(used);  // HELLO_REPLY field 5: VRAM-cached bytes (0 = file mode)
+                // HELLO_REPLY field 6: held set, one bit per pair row-major.
+                // Lets the engine skip hot pairs without a round trip.
+                {
+                    size_t mapbytes = (size_t) (((uint64_t) nl * (uint64_t) ne + 7) / 8);
+                    size_t base = rep.size();
+                    rep.resize(base + mapbytes, 0);
+                    for (int64_t l = 0; l < nl; ++l)
+                        for (int64_t e = 0; e < ne; ++e) {
+                            uint64_t i = (uint64_t) l * (uint64_t) ne + (uint64_t) e;
+                            if (slot[(size_t) i] >= 0) rep[base + (i >> 3)] |= (uint8_t) (1u << (i & 7));
+                        }
+                }
                 if (!send_frame(fd, (uint32_t) pw::HELLO_REPLY, rep.data(), rep.size())) break;
             } else if (op == pw::GET) {
                 ++gets;

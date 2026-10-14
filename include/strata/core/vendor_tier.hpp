@@ -43,6 +43,15 @@ public:
     /// The wrapped source (null when closed): mode checks compare against
     /// this, so a wrapped arena still counts as the arena.
     ExpertSource* inner() const { return inner_; }
+    /// The daemon's held set as a bitset over (layer, expert) (HELLO_REPLY
+    /// field 6, empty = unknown: ask the daemon). Checking it first keeps
+    /// hot pairs the engine already holds off the socket entirely.
+    bool daemon_holds(int64_t layer, int64_t expert) const {
+        if (held_bits_.empty() || layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_)
+            return true;  // unknown: ask (fail-open direction)
+        uint64_t i = (uint64_t) layer * (uint64_t) experts_ + (uint64_t) expert;
+        return (held_bits_[i >> 3] & (uint8_t) (1u << (i & 7))) != 0;
+    }
     /// Whether the daemon holds a VRAM cache (HELLO_REPLY field 5 > 0):
     /// only then does blob() fetch daemon-first (a file-backed daemon is
     /// no faster than the inner source, so blob() delegates to it).
@@ -64,6 +73,7 @@ public:
     // Counters, for the driver to report rather than for control flow.
     int64_t tier_hits() const { return tier_hits_; }
     int64_t tier_misses() const { return tier_misses_; }
+    int64_t tier_skipped() const { return tier_skipped_; }
     int64_t tier_fallback_bytes() const { return tier_fallback_bytes_; }
     int64_t tier_hash_mismatches() const { return tier_hash_mismatches_; }
 
@@ -93,6 +103,8 @@ private:
     uint64_t staging_bytes_ = 0;  ///< per-slot bytes (layout max_blob)
     size_t staging_next_ = 0;
     uint64_t vram_cached_ = 0;  ///< daemon VRAM bytes (HELLO_REPLY field 5)
+    std::vector<uint8_t> held_bits_;  ///< HELLO_REPLY field 6 (empty = ask)
+    int64_t tier_skipped_ = 0;  ///< pairs answered from inner_ via the bitset
     // The socket is one stream: all send/recv sequences take mu_ so two
     // calling threads can never interleave frames (copy_blobs runs on the
     // prompt stager's threads).

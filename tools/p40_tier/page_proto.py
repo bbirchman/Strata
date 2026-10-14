@@ -132,6 +132,11 @@ class _Handler(BaseRequestHandler):
                         self.request.sendall(encode_frame(ERROR, b"version"))
                         return
                     reply = struct.pack("<IQQQQ", VERSION, BLOB_BYTES, store.layers, store.experts, 0)
+                    nbits, nbytes = store.layers * store.experts, (store.layers * store.experts + 7) // 8
+                    bits = bytearray(nbytes)
+                    for i in range(nbits):
+                        bits[i >> 3] |= 1 << (i & 7)
+                    reply += bytes(bits)
                     self.request.sendall(encode_frame(HELLO_REPLY, reply))
                 elif op == GET:
                     layer, expert = struct.unpack("<QQ", payload[:16])
@@ -182,8 +187,17 @@ class PageClient:
             raise ConnectionError(f"expected HELLO_REPLY, got op {op}")
         ver, self.blob_bytes, self.layers, self.experts = struct.unpack("<IQQQ", reply[:28])
         self.vram_cached = struct.unpack("<Q", reply[28:36])[0] if len(reply) >= 36 else 0
+        self.held_bits = reply[36:]
         if ver != VERSION:
             raise ConnectionError(f"server version {ver} != {VERSION}")
+
+    def daemon_holds(self, layer, expert):
+        if not self.held_bits:
+            return True
+        if not (0 <= layer < self.layers and 0 <= expert < self.experts):
+            return False
+        i = layer * self.experts + expert
+        return bool(self.held_bits[i >> 3] & (1 << (i & 7)))
 
     def get(self, layer: int, expert: int) -> bytes | None:
         self.sock.sendall(encode_frame(GET, struct.pack("<QQ", layer, expert)))

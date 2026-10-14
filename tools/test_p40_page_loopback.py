@@ -46,6 +46,10 @@ class PageLoopbackTest(unittest.TestCase):
     def test_hello_reports_geometry(self):
         self.assertEqual(self.client.blob_bytes, BLOB_BYTES)
         self.assertEqual((self.client.layers, self.client.experts), (48, 512))
+        self.assertEqual(self.client.vram_cached, 0)
+        self.assertTrue(self.client.daemon_holds(0, 0))
+        self.assertTrue(self.client.daemon_holds(47, 511))
+        self.assertFalse(self.client.daemon_holds(48, 0))
 
     def test_blobs_byte_exact(self):
         pairs = [(0, 0), (0, 511), (47, 511), (23, 256), (7, 42)]

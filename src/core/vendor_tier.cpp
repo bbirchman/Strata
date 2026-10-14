@@ -258,6 +258,15 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
     // delegates to the inner source.
     uint64_t vc = 0;
     if (reply.size() >= 36) std::memcpy(&vc, reply.data() + 28, 8);
+    // HELLO_REPLY field 6 (optional, v1.2): the daemon's held set, one bit
+    // per (layer, expert) in row-major order over the DAEMON's geometry.
+    // Exact-size match only; anything else means "unknown", i.e. ask.
+    std::vector<uint8_t> held;
+    if (nl > 0 && ne > 0 && (uint64_t) nl <= 1024 && (uint64_t) ne <= 4096) {
+        uint64_t mapbytes = ((uint64_t) nl * (uint64_t) ne + 7) / 8;
+        if (reply.size() == 36 + (size_t) mapbytes)
+            held.assign(reply.begin() + 36, reply.end());
+    }
     if (trace_on() && trace_next() < kTraceCap)
         std::fprintf(stderr, "p40tier: HELLO geometry %llu x %llu, daemon VRAM cache %.2f GiB\n",
                      (unsigned long long) nl, (unsigned long long) ne, (double) vc / 1073741824.0);
@@ -267,6 +276,8 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
     layers_ = (int64_t) nl;
     experts_ = (int64_t) ne;
     vram_cached_ = vc;
+    held_bits_ = std::move(held);
+    tier_skipped_ = 0;
     staging_.clear();
     staging_bytes_ = 0;
     staging_next_ = 0;
@@ -304,6 +315,7 @@ void VendorTierSource::close() {
     staging_bytes_ = 0;
     staging_next_ = 0;
     vram_cached_ = 0;
+    held_bits_.clear();
     inner_ = nullptr;
 }
 
@@ -322,6 +334,10 @@ const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
         want = strata::kernels::cpu::expert_layout().blob_bytes(layer);
     } catch (...) { return inner_->blob(layer, expert); }
     if (want == 0 || want > staging_bytes_) return inner_->blob(layer, expert);
+    if (!daemon_holds(layer, expert)) {
+        __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+        return inner_->blob(layer, expert);
+    }
     for (size_t n = 0; n < staging_.size(); ++n) {
         size_t i = (staging_next_ + n) % staging_.size();
         StagingSlot& s = staging_[i];
@@ -362,6 +378,10 @@ bool VendorTierSource::fetch_one(int64_t layer, int64_t expert, uint8_t* dst) no
 
 bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept {
     if (fd_ < 0 || inner_ == nullptr) return false;
+    if (!daemon_holds(layer, expert)) {
+        __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+        return false;
+    }
     if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_) return false;
     // Engine-side size for this pair (native packs vary per layer).
     uint64_t want = 0;
