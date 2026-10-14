@@ -58,10 +58,17 @@ Python round trip per blob.
 - Build every backend touched (CUDA daemon, HIP engine) before review.
 - Numbers reported with what they were measured on (GPUs, RAM, NVMe).
 
-## What remains
+## Validation ladder (user PC: 7800XT + P40 + 32GB, CachyOS)
 
-1. C++ `RemoteVendorSource` + daemon + flag plumbing in `generate.cpp`.
-2. Real-blob addressing: (layer, expert) -> pack offsets (experts.bin /
-   GGUF native layout), replacing the fixture synthesizer.
-3. User-side validation on 7800XT + P40 + 32GB: resident-fit check,
-   128K then 256K Coder / IQ2_XS / XXS runs with `--kv-resident 32768`.
+0. BEFORE ANY GPU RUN: stop llama-swap - `systemctl stop llama-swap`
+   (it locks both GPUs). Re-check with `nvidia-smi` / `rocm-smi` that both
+   cards are free before every rung below.
+1. Coder 256K, single GPU (no tier): `--max-context 262144 --kv-resident
+   32768 --resident-experts --kv int8` (+ `STRATA_DENSE_F32=1` on P40).
+2. IQ2_XS 256K, single GPU, same flags.
+3. XXS 128K, single GPU (setup default cap).
+4. XXS 256K forced (`--max-context 262144`), single GPU.
+5. Repeat 1-4 with `--p40-tier SOCK` (daemon on Ponce holding the cold
+   tail): expect prefill faster-or-equal, decode equal-or-better, zero
+   SSD reads in steady state; greedy-compare rung 4 vs rung 5 for
+   coherence (divergence across vendors is expected, garbage is not).
