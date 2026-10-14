@@ -267,9 +267,12 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
         if (reply.size() == 36 + (size_t) mapbytes)
             held.assign(reply.begin() + 36, reply.end());
     }
-    if (trace_on() && trace_next() < kTraceCap)
-        std::fprintf(stderr, "p40tier: HELLO geometry %llu x %llu, daemon VRAM cache %.2f GiB\n",
-                     (unsigned long long) nl, (unsigned long long) ne, (double) vc / 1073741824.0);
+    // Always reported (one line per run, startup-only): geometry as parsed,
+    // the daemon's VRAM cache, and the held-bitmap state behind blob().
+    std::fprintf(stderr,
+                 "p40tier: HELLO geometry %llu x %llu, daemon VRAM cache %.2f GiB, bitmap %zu bytes (%s)\n",
+                 (unsigned long long) nl, (unsigned long long) ne, (double) vc / 1073741824.0,
+                 held.size(), held.empty() ? "absent: asking daemon for everything" : "parsed");
     fd_ = fd;
     inner_ = inner;
     blob_bytes_ = bb;
