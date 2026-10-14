@@ -266,6 +266,10 @@ int main(int argc, char** argv) {
                      "\np40_daemon: VRAM cache: %zu experts, %.2f GiB at %.2f GiB/s (--vram-gib %.1f)\n",
                      held.size(), (double) used / 1073741824.0, s > 0 ? (double) used / 1073741824.0 / s : 0,
                      a.vram_gib);
+    std::fprintf(stderr, "p40_daemon: geometry %lld layers x %lld experts, slot table %zu; held head (%d,%d) tail (%d,%d)\n",
+                 (long long) nl, (long long) ne, slot.size(), held.empty() ? -1 : held.front().l,
+                 held.empty() ? -1 : held.front().e, held.empty() ? -1 : held.back().l,
+                 held.empty() ? -1 : held.back().e);
     } else {
         std::fprintf(stderr, "p40_daemon: file-backed mode (--vram-gib 0): serving pack bytes, no VRAM cache\n");
     }

@@ -258,6 +258,9 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
     // delegates to the inner source.
     uint64_t vc = 0;
     if (reply.size() >= 36) std::memcpy(&vc, reply.data() + 28, 8);
+    if (trace_on() && trace_next() < kTraceCap)
+        std::fprintf(stderr, "p40tier: HELLO geometry %llu x %llu, daemon VRAM cache %.2f GiB\n",
+                     (unsigned long long) nl, (unsigned long long) ne, (double) vc / 1073741824.0);
     fd_ = fd;
     inner_ = inner;
     blob_bytes_ = bb;
