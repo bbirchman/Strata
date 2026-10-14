@@ -52,6 +52,7 @@ public:
     // file-mode delegates), copy_blob(s) try the daemon then fall back per
     // pair, prefetch/warm hint both daemon and inner.
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
                     uint8_t* const* dst, size_t n) override;
