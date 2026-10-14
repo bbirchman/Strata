@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -292,13 +293,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "p40_daemon: bind/listen failed\n");
         return 1;
     }
+    // Bulk BLOBs (2+ MB) must never wedge against a pausing peer: 16 MB
+    // buffers absorb whole frames either way; 30 s I/O deadlines stop a
+    // wedged client from pinning the single serving thread forever.
+    int bigbuf = 16 << 20;
+    ::setsockopt(srv, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
+    ::setsockopt(srv, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
     std::fprintf(stderr, "p40_daemon: pack %s, profile %s (%lld pairs), socket %s, device %d\n",
                  a.pack.c_str(), a.profile.c_str(), (long long) ranked.size(), a.socket.c_str(),
                  a.device);
     uint64_t gets = 0, hits = 0, misses = 0, served = 0;
+    long long trace_n = 0;
+    const bool trace = [] {
+        const char* e = std::getenv("STRATA_P40_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
     for (;;) {
         int fd = ::accept(srv, nullptr, nullptr);
         if (fd < 0) break;
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
+        timeval dtv{30, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &dtv, sizeof(dtv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &dtv, sizeof(dtv));
         for (;;) {
             uint32_t op = 0;
             std::vector<uint8_t> req;
@@ -350,6 +367,11 @@ int main(int argc, char** argv) {
                 }
                 if (bytes == nullptr || nb == 0) {
                     ++misses;
+                    if (trace && trace_n < 200) {
+                        std::fprintf(stderr, "p40d: GET (%lld,%lld) -> MISS\n", (long long) l,
+                                     (long long) e);
+                        ++trace_n;
+                    }
                     uint8_t m[16];
                     std::memcpy(m, &l, 8);
                     std::memcpy(m + 8, &e, 8);
@@ -358,6 +380,11 @@ int main(int argc, char** argv) {
                 }
                 ++hits;
                 served += nb;
+                if (trace && trace_n < 200) {
+                    std::fprintf(stderr, "p40d: GET (%lld,%lld) -> BLOB %llu B\n", (long long) l,
+                                 (long long) e, (unsigned long long) nb);
+                    ++trace_n;
+                }
                 pw::Sha256 hsh;
                 hsh.update(bytes, (size_t) nb);
                 auto dg = hsh.final();

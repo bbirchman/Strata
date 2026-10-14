@@ -136,6 +136,20 @@ bool recv_all(int fd, uint8_t* p, size_t n) {
     }
     return true;
 }
+// STRATA_P40_TRACE=1: log the first 500 socket ops (op, layer, expert) to
+// stderr so a flood names its caller. Off by default (hot path).
+bool trace_on() {
+    static bool v = [] {
+        const char* e = std::getenv("STRATA_P40_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+long long trace_next() {
+    static long long n = 0;
+    return __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+}
+constexpr long long kTraceCap = 500;
 void put_u32(std::vector<uint8_t>& v, uint32_t x) {
     v.push_back((uint8_t) x); v.push_back((uint8_t) (x >> 8));
     v.push_back((uint8_t) (x >> 16)); v.push_back((uint8_t) (x >> 24));
@@ -192,6 +206,11 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
     timeval tv{10, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // Bulk BLOBs (2+ MB) must never wedge against a peer that recvs normally:
+    // 16 MB buffers absorb a whole frame either way.
+    int bigbuf = 16 << 20;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
 
     std::vector<uint8_t> hello;
     put_u32(hello, kVersion);
@@ -352,12 +371,22 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     h->magic = kMagic; h->op = GET; h->len = 16;
     std::memcpy(req + sizeof(Header), &layer, 8);
     std::memcpy(req + sizeof(Header) + 8, &expert, 8);
-    if (!send_all(fd_, req, sizeof(req))) return false;
+    if (!send_all(fd_, req, sizeof(req))) {
+        if (trace_on() && trace_next() < kTraceCap)
+            std::fprintf(stderr, "p40tier: GET (%lld,%lld) send-fail\n", (long long) layer,
+                         (long long) expert);
+        return false;
+    }
+    if (trace_on() && trace_next() < kTraceCap)
+        std::fprintf(stderr, "p40tier: GET (%lld,%lld) sent\n", (long long) layer, (long long) expert);
     Header rh{};
     if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) return false;
     if (rh.magic != kMagic || rh.len > kMaxPayload) return false;
     if (rh.op == MISS) {
         __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
+        if (trace_on() && trace_next() < kTraceCap)
+            std::fprintf(stderr, "p40tier: GET (%lld,%lld) -> MISS\n", (long long) layer,
+                         (long long) expert);
         return false;
     }
     if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want) {
@@ -385,6 +414,9 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     }
     __atomic_fetch_add(&tier_hits_, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&reads_, 1, __ATOMIC_RELAXED);
+    if (trace_on() && trace_next() < kTraceCap)
+        std::fprintf(stderr, "p40tier: GET (%lld,%lld) -> BLOB %llu B\n", (long long) layer,
+                     (long long) expert, (unsigned long long) want);
     return true;
 }
 
