@@ -476,35 +476,10 @@ bool VendorTierSource::copy_blobs(const int32_t* layers, const int32_t* experts,
 }
 
 void VendorTierSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (fd_ >= 0 && n > 0) {
-    // Bounded batches of 64: hint the daemon, then hint inner_ too (it may
-    // warm file pages for whatever the daemon misses).
-    for (int64_t base = 0; base < n; base += 64) {
-        int64_t m = n - base < 64 ? n - base : 64;
-        std::vector<uint8_t> payload;
-        put_u32(payload, (uint32_t) m);
-        for (int64_t i = 0; i < m; ++i) {
-            put_u64(payload, (uint64_t) layer);
-            put_u64(payload, (uint64_t) experts[base + i]);
-        }
-        std::vector<uint8_t> frame;
-        Header h{kMagic, PREFETCH, (uint64_t) payload.size()};
-        frame.insert(frame.end(), (uint8_t*) &h, (uint8_t*) &h + sizeof(h));
-        frame.insert(frame.end(), payload.begin(), payload.end());
-        if (!send_all(fd_, frame.data(), frame.size())) break;
-        Header rh{};
-        if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh)) || rh.magic != kMagic) break;
-        std::vector<uint8_t> rest;
-        if (rh.len > 0 && rh.len <= kMaxPayload) {
-            rest.resize((size_t) rh.len);
-            if (!recv_all(fd_, rest.data(), rest.size())) break;
-        }
-        if (rh.op != ACK) break;
-    }
-        }
-    }
+    // The daemon needs no warming: it either holds the pair (served on
+    // demand) or not (MISS). Forward to inner_ only, so the hot path pays
+    // zero socket round trips here (a PREFETCH+ACK per layer per token
+    // measured as pure overhead: 9.8 -> 6.4 tok/s with zero GETs served).
     if (inner_ != nullptr) inner_->prefetch(layer, experts, n);
 }
 
