@@ -285,9 +285,17 @@ bool VendorTierSource::open(const std::string& socket_path, ExpertSource* inner,
     staging_bytes_ = 0;
     staging_next_ = 0;
     if (vc > 0) {
+        // Native packs vary per layer (up to ~2.7 MB observed) while
+        // max_blob can still read the canonical default: take the true max
+        // over every layer, else every blob() call fails the size gate and
+        // the tier silently never serves (XXS mmap symptom: 0 GETs).
         uint64_t mb = 0;
         try {
-            mb = strata::kernels::cpu::expert_layout().max_blob;
+            const auto& pl = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < nl; ++l) {
+                uint64_t b = pl.blob_bytes(l);
+                if (b > mb) mb = b;
+            }
         } catch (...) { mb = 0; }
         if (mb > 0 && mb <= kMaxPayload) {
             staging_.resize(kStagingSlots);
