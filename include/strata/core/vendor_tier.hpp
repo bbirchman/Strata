@@ -71,6 +71,15 @@ public:
     // file-mode delegates), copy_blob(s) try the daemon then fall back per
     // pair, prefetch/warm hint both daemon and inner.
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    // pinned()/device_alias() return false/null so misses NEVER take the
+    // kind=1 GPU-direct path (which reads file-mapped pages behind the
+    // tier's back): every non-VRAM pair flows through blob()/copy_blob(),
+    // where daemon-held cold pairs come from P40 VRAM and the rest falls
+    // back to the base. VRAM hits (kind=0) are untouched. Trade: unheld
+    // pairs move from GPU-direct to CPU-pool compute; P40-held pairs move
+    // from SSD-mapped to VRAM-served. Net measured per run, A/B.
+    bool pinned(int64_t, int64_t) const override { return false; }
+    const uint8_t* device_alias(int64_t, int64_t) const override { return nullptr; }
     // Prefill fills and swap-ins read through blob_stable (the mapping-aware
     // path), not blob: without this override the tier watches a road nothing
     // drives (0 GETs across whole XXS sessions proved it). Same daemon-first
