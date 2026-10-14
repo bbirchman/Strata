@@ -48,12 +48,10 @@ public:
     /// no faster than the inner source, so blob() delegates to it).
     bool vram_backed() const { return vram_cached_ > 0; }
 
-    // ExpertSource: batched paths go to the daemon first, then inner_.
-    // blob()/blob_stable() stay on inner_ (the synchronous contract cannot
-    // hide a socket round trip; the daemon feeds the batched paths and the
-    // prefetch hints, which is where the file tier's misses come from).
+    // ExpertSource: blob() fetches daemon-first (VRAM-mode daemons only;
+    // file-mode delegates), copy_blob(s) try the daemon then fall back per
+    // pair, prefetch/warm hint both daemon and inner.
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
                     uint8_t* const* dst, size_t n) override;
@@ -94,7 +92,6 @@ private:
     uint64_t staging_bytes_ = 0;  ///< per-slot bytes (layout max_blob)
     size_t staging_next_ = 0;
     uint64_t vram_cached_ = 0;  ///< daemon VRAM bytes (HELLO_REPLY field 5)
-    void note_async_read(const uint8_t* blob, void* stream) override;
     // The socket is one stream: all send/recv sequences take mu_ so two
     // calling threads can never interleave frames (copy_blobs runs on the
     // prompt stager's threads).
