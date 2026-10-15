@@ -13082,17 +13082,21 @@ int main(int argc, char** argv) {
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
                              src.gguf_mode() ? " (the GGUF in place)" : "");
                 if (srcp == &p40_src)
-                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches, %lld hot-skipped\n",
+                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches, %lld hot-skipped, %.1f s in tier (%lld batches)\n",
                                  (long long) p40_src.tier_hits(), (long long) p40_src.tier_misses(),
                                  (double) p40_src.tier_fallback_bytes() / 1e6,
                                  (long long) p40_src.tier_hash_mismatches(),
-                                 (long long) p40_src.tier_skipped());
+                                 (long long) p40_src.tier_skipped(),
+                                 (double) p40_src.tier_us() / 1e6,
+                                 (long long) p40_src.tier_batches());
                 else if (srcp == &src && src.valid())
-                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches, %lld hot-skipped\n",
+                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches, %lld hot-skipped, %.1f s in tier (%lld batches)\n",
                                  (long long) src.tier_hits(), (long long) src.tier_misses(),
                                  (double) src.tier_fallback_bytes() / 1e6,
                                  (long long) src.tier_hash_mismatches(),
-                                 (long long) src.tier_skipped());
+                                 (long long) src.tier_skipped(),
+                                 (double) src.tier_us() / 1e6,
+                                 (long long) src.tier_batches());
                 // what the OS did for this request (since the previous one): the drive's share of the file tier's reads
                 // against the page cache's, and what the I/O path did about it
                 static strata::platform::ProcIo io_prev;

@@ -161,6 +161,21 @@ void trace_decision(const char* what, int64_t layer, int64_t expert, const char*
         std::fprintf(stderr, "p40tier: %s (%lld,%lld) -> %s\n", what, (long long) layer,
                      (long long) expert, why);
 }
+// White-box timing: RAII microsecond accumulator (anonymous-namespace,
+// header-free). Put one past the eligibility checks in each fetch path;
+// per-request tier time = delta of tier_us().
+struct TierTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    int64_t* dst = nullptr;
+    explicit TierTimer(int64_t* d) : dst(d) {}
+    ~TierTimer() {
+        __atomic_fetch_add(dst,
+                           (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count(),
+                           __ATOMIC_RELAXED);
+    }
+};
 void put_u32(std::vector<uint8_t>& v, uint32_t x) {
     v.push_back((uint8_t) x); v.push_back((uint8_t) (x >> 8));
     v.push_back((uint8_t) (x >> 16)); v.push_back((uint8_t) (x >> 24));
@@ -463,6 +478,7 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         want = strata::kernels::cpu::expert_layout().blob_bytes(layer);
     } catch (...) { return false; }
     if (want == 0 || want > kMaxPayload - 64) return false;
+    TierTimer _tt(&tier_us_);
     uint8_t req[sizeof(Header) + 16];
     Header* h = (Header*) req;
     h->magic = kMagic; h->op = GET; h->len = 16;
@@ -563,6 +579,8 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
                                           const size_t* idx, size_t m, char* ok) noexcept {
     if (fd_ < 0 || m == 0 || m > 64) return false;
     for (size_t k = 0; k < m; ++k) ok[idx[k]] = false;
+    TierTimer _tt(&tier_us_);
+    __atomic_fetch_add(&tier_batches_, 1, __ATOMIC_RELAXED);
     std::vector<uint8_t> req;
     req.reserve(sizeof(Header) + 4 + m * 16);
     Header h{kMagic, FETCH_N, (uint64_t)(4 + m * 16)};

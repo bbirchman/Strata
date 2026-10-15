@@ -109,6 +109,10 @@ public:
     int64_t tier_skipped() const { return tier_skipped_; }
     int64_t tier_fallback_bytes() const { return tier_fallback_bytes_; }
     int64_t tier_hash_mismatches() const { return tier_hash_mismatches_; }
+    int64_t tier_batches() const { return tier_batches_; }
+    // Cumulative microseconds inside daemon round trips (fetch_one +
+    // fetch_batch; per-request tier time = delta of this counter).
+    int64_t tier_us() const { return tier_us_; }
 
 private:
     // One GET round trip. Returns true with bytes in dst on BLOB with a
@@ -181,6 +185,8 @@ private:
     int64_t layers_ = 0, experts_ = 0;
     int64_t tier_hits_ = 0, tier_misses_ = 0;
     int64_t tier_fallback_bytes_ = 0, tier_hash_mismatches_ = 0;
+    int64_t tier_batches_ = 0;  ///< FETCH_N round trips issued
+    int64_t tier_us_ = 0;       ///< us inside daemon round trips (all pairs)
     int64_t reads_ = 0;
 };
 

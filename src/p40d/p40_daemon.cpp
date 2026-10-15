@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "p40_daemon: [%s] pack %s, profile %s (%lld pairs), socket %s, device %d\n",
                  timestamp().c_str(), a.pack.c_str(), a.profile.c_str(), (long long) ranked.size(), a.socket.c_str(),
                  a.device);
-    uint64_t gets = 0, hits = 0, misses = 0, served = 0;
+    uint64_t gets = 0, hits = 0, misses = 0, served = 0, d2h_us = 0;
     long long trace_n = 0;
     const bool trace = [] {
         const char* e = std::getenv("STRATA_P40_TRACE");
@@ -373,13 +373,23 @@ int main(int argc, char** argv) {
             // false = transport broke, drop the client.
             auto serve_pair = [&](int64_t l, int64_t e) -> bool {
                 ++gets;
+                if (gets % 1000 == 0)
+                    std::fprintf(stderr,
+                                 "p40_daemon: [%s] progress: %llu gets %llu hits %llu misses %.2f GiB served, mean D2H %llu us\n",
+                                 timestamp().c_str(), (unsigned long long) gets, (unsigned long long) hits,
+                                 (unsigned long long) misses, (double) served / 1073741824.0,
+                                 hits > 0 ? d2h_us / hits : 0);
                 int32_t s = (l < 0 || e < 0 || l >= nl || e >= ne) ? -1 : slot[(size_t) (l * ne + e)];
                 const uint8_t* bytes = nullptr;
                 uint64_t nb = 0;
                 if (s >= 0 && dev != nullptr) {
-                    if (::cudaMemcpy(stage, (uint8_t*) dev + held[(size_t) s].off,
-                                     (size_t) held[(size_t) s].bytes,
-                                     cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    const auto d2h0 = std::chrono::steady_clock::now();
+                    bool d2h_ok = ::cudaMemcpy(stage, (uint8_t*) dev + held[(size_t) s].off,
+                                               (size_t) held[(size_t) s].bytes,
+                                               cudaMemcpyDeviceToHost) == cudaSuccess;
+                    d2h_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - d2h0).count();
+                    if (d2h_ok) {
                         bytes = stage;
                         nb = held[(size_t) s].bytes;
                     }
