@@ -552,19 +552,19 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         if (trace_on() && trace_next() < kTraceCap)
             std::fprintf(stderr, "p40tier: GET (%lld,%lld) send-fail\n", (long long) layer,
                          (long long) expert);
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:send");
         return false;
     }
     if (trace_on() && trace_next() < kTraceCap)
         std::fprintf(stderr, "p40tier: GET (%lld,%lld) sent\n", (long long) layer, (long long) expert);
     Header rh{};
     if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:recv-hdr");
         return false;
     }
     const auto t1 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (rh.magic != kMagic || rh.len > kMaxPayload) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:bad-hdr");
         return false;
     }
     if (rh.op == MISS) {
@@ -582,14 +582,14 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         std::vector<uint8_t> drain;
         drain.resize((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
         if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("one:drain");
             return false;
         }
         return false;
     }
     uint8_t meta[48];
     if (!recv_all(fd_, meta, sizeof(meta))) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:meta");
         return false;
     }
     int64_t rl = 0, re = 0;
@@ -597,11 +597,11 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     // Address mismatch: the daemon answered for another pair; its blob body
     // is still on the wire -> the stream is desynced. Drop, never continue.
     if (rl != layer || re != expert) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:addr");
         return false;
     }
     if (!recv_all(fd_, dst, (size_t) want)) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("one:blob");
         return false;
     }
     if (timed) {
@@ -682,7 +682,7 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
         req.insert(req.end(), (uint8_t*) &e, (uint8_t*) &e + 8);
     }
     if (!send_all(fd_, req.data(), req.size())) {
-        drop_tier_locked(__func__);
+        drop_tier_locked("batch:send");
         return false;
     }
     static bool verify = [] {
@@ -692,11 +692,11 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
     for (size_t k = 0; k < m; ++k) {
         Header rh{};
         if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("batch:recv-hdr");
             return false;
         }
         if (rh.magic != kMagic || rh.len > kMaxPayload) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("batch:bad-hdr");
             return false;
         }
         if (rh.op == ERROR) {
@@ -708,7 +708,7 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
             if (rh.len > 0) {
                 std::vector<uint8_t> drain((size_t) rh.len);
                 if (!recv_all(fd_, drain.data(), drain.size())) {
-                    drop_tier_locked(__func__);
+                    drop_tier_locked("batch:err-drain");
                     return false;
                 }
             }
@@ -716,12 +716,12 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
         }
         if (rh.op == MISS) {
             if (rh.len != 16) {
-                drop_tier_locked(__func__);
+                drop_tier_locked("batch:miss-len");
                 return false;
             }
             uint8_t mm[16];
             if (!recv_all(fd_, mm, sizeof(mm))) {
-                drop_tier_locked(__func__);
+                drop_tier_locked("batch:miss-body");
                 return false;
             }
             __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
@@ -731,7 +731,7 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
         if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want[idx[k]]) {
             std::vector<uint8_t> drain((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
             if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) {
-                drop_tier_locked(__func__);
+                drop_tier_locked("batch:drain");
                 return false;
             }
             ok[idx[k]] = false;
@@ -739,17 +739,17 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
         }
         uint8_t meta[48];
         if (!recv_all(fd_, meta, sizeof(meta))) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("batch:meta");
             return false;
         }
         int64_t rl = 0, re = 0;
         std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
         if (rl != (int64_t) layers[idx[k]] || re != (int64_t) experts[idx[k]]) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("batch:addr");
             return false;
         }
         if (!recv_all(fd_, dst[idx[k]], (size_t) want[idx[k]])) {
-            drop_tier_locked(__func__);
+            drop_tier_locked("batch:blob");
             return false;
         }
         if (verify) {
