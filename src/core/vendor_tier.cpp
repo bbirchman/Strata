@@ -673,15 +673,21 @@ bool VendorTierSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     }
     bool all = true;
     if (!idx.empty()) {
-        std::lock_guard<std::mutex> lock(mu_);
         std::vector<char> ok(n, 0); // char: no vector<bool> bitpacking
         for (size_t c = 0; c < idx.size(); c += 64) {
             size_t m = std::min<size_t>(64, idx.size() - c);
-            // fetch_batch_locked marks ok[]; false = transport broke or an
-            // old daemon: remaining pairs fall back (per-pair GETs speak to
-            // every daemon), already-received blobs stay served.
-            (void) fetch_batch_locked(layers, experts, dst, want.data(), idx.data() + c, m,
-                                      ok.data());
+            // Lock only around the batch round trip (the socket is one
+            // stream: frames must never interleave). NEVER hold mu_ across
+            // the fallback below: the base copy re-enters tier methods that
+            // take mu_, and it is non-recursive (first fallback hung).
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                // fetch_batch_locked marks ok[]; false = transport broke or
+                // an old daemon: remaining pairs fall back (per-pair GETs
+                // speak to every daemon), received blobs stay served.
+                (void) fetch_batch_locked(layers, experts, dst, want.data(), idx.data() + c, m,
+                                          ok.data());
+            }
             for (size_t k = 0; k < m; ++k) batched[idx[c + k]] = ok[idx[c + k]];
         }
     }
