@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
         if (fd < 0) break;
         ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
         ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
-        timeval dtv{30, 0};
+        timeval dtv{3600, 0};
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &dtv, sizeof(dtv));
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &dtv, sizeof(dtv));
         for (;;) {
