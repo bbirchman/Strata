@@ -4841,7 +4841,7 @@ int main(int argc, char** argv) {
         src.set_gguf(o.native_preset);
         if (const char* v = std::getenv("STRATA_FETCH_THREADS"); v != nullptr && std::atoi(v) > 0)
             src.set_fetch_threads(std::atoi(v));
-        if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
+        if (!src.FileExpertSource::open(o.pack, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

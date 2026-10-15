@@ -71,15 +71,21 @@ public:
     // file-mode delegates), copy_blob(s) try the daemon then fall back per
     // pair, prefetch/warm hint both daemon and inner.
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    // pinned()/device_alias() return false/null so misses NEVER take the
-    // kind=1 GPU-direct path (which reads file-mapped pages behind the
-    // tier's back): every non-VRAM pair flows through blob()/copy_blob(),
-    // where daemon-held cold pairs come from P40 VRAM and the rest falls
-    // back to the base. VRAM hits (kind=0) are untouched. Trade: unheld
-    // pairs move from GPU-direct to CPU-pool compute; P40-held pairs move
-    // from SSD-mapped to VRAM-served. Net measured per run, A/B.
-    bool pinned(int64_t, int64_t) const override { return false; }
-    const uint8_t* device_alias(int64_t, int64_t) const override { return nullptr; }
+    // pinned()/device_alias() return false/null WHILE the tier is active
+    // (valid()) so misses NEVER take the kind=1 GPU-direct path (which
+    // reads file-mapped pages behind the tier's back): every non-VRAM pair
+    // flows through blob()/copy_blob(), where daemon-held cold pairs come
+    // from P40 VRAM and the rest falls back to the base. VRAM hits (kind=0)
+    // are untouched. Tier off (flag absent / daemon refused): stock
+    // behavior, bit for bit. Trade when on: unheld pairs move from
+    // GPU-direct to CPU-pool compute; P40-held pairs move from SSD-mapped
+    // to VRAM-served. Net measured per run, A/B.
+    bool pinned(int64_t l, int64_t e) const override {
+        return valid() ? false : FileExpertSource::pinned(l, e);
+    }
+    const uint8_t* device_alias(int64_t l, int64_t e) const override {
+        return valid() ? nullptr : FileExpertSource::device_alias(l, e);
+    }
     // Prefill fills and swap-ins read through blob_stable (the mapping-aware
     // path), not blob: without this override the tier watches a road nothing
     // drives (0 GETs across whole XXS sessions proved it). Same daemon-first
@@ -94,7 +100,7 @@ public:
                     uint8_t* const* dst, size_t n) override;
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
-    bool warms() const override { return valid(); }
+    bool warms() const override { return valid() || FileExpertSource::warms(); }
     int64_t reads() const override;
 
     // Counters, for the driver to report rather than for control flow.
