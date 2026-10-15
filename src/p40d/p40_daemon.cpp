@@ -49,6 +49,15 @@
 
 namespace pw = strata::core::pagewire;
 
+static std::string timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&tt));
+    return std::string(buf) + "." + std::to_string(ms.count()).substr(0,3);
+}
+
 namespace {
 
 bool send_all(int fd, const uint8_t* p, size_t n) {
@@ -187,18 +196,18 @@ int main(int argc, char** argv) {
     Args a;
     std::string err;
     if (!parse_args(argc, argv, a, err)) {
-        std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
+        std::fprintf(stderr, "p40_daemon: [%s] %s\n", timestamp().c_str(), err.c_str());
         return 2;
     }
     if (::cudaSetDevice(a.device) != cudaSuccess) {
-        std::fprintf(stderr, "p40_daemon: cudaSetDevice(%d) failed: %s\n", a.device,
+        std::fprintf(stderr, "p40_daemon: [%s] cudaSetDevice(%d) failed: %s\n", timestamp().c_str(), a.device,
                      ::cudaGetErrorString(::cudaGetLastError()));
         return 1;
     }
     int64_t nl = 0, ne = 0;
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!read_ranked(a.profile, nl, ne, ranked, err)) {
-        std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
+        std::fprintf(stderr, "p40_daemon: [%s] %s\n", timestamp().c_str(), err.c_str());
         return 1;
     }
     strata::core::FileExpertSource src;
@@ -207,11 +216,11 @@ int main(int argc, char** argv) {
     // does this before opening any source); without it the global still
     // says canonical 48x512 and a pruned pack (Coder: 256/layer) refuses.
     if (!strata::kernels::cpu::expert_layout_load(a.pack, nl, ne, err)) {
-        std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
+        std::fprintf(stderr, "p40_daemon: [%s] %s\n", timestamp().c_str(), err.c_str());
         return 1;
     }
     if (!src.open(a.pack, nl, ne, err)) {
-        std::fprintf(stderr, "p40_daemon: %s\n", err.c_str());
+        std::fprintf(stderr, "p40_daemon: [%s] %s\n", timestamp().c_str(), err.c_str());
         return 1;
     }
     const auto& pl = strata::kernels::cpu::expert_layout();
@@ -240,7 +249,7 @@ int main(int argc, char** argv) {
     uint8_t* dev = nullptr;
     if (!held.empty()) {
         if (::cudaMalloc(&dev, (size_t) used) != cudaSuccess) {
-            std::fprintf(stderr, "p40_daemon: cudaMalloc(%.2f GiB) failed: %s\n",
+            std::fprintf(stderr, "p40_daemon: [%s] cudaMalloc(%.2f GiB) failed: %s\n", timestamp().c_str(),
                          (double) used / 1073741824.0, ::cudaGetErrorString(::cudaGetLastError()));
             return 1;
         }
@@ -249,53 +258,53 @@ int main(int argc, char** argv) {
         for (const auto& h : held) {
             const uint8_t* b = src.blob_stable(h.l, h.e);
             if (b == nullptr) {
-                std::fprintf(stderr, "p40_daemon: pack read failed at (%d,%d)\n", h.l, h.e);
+                std::fprintf(stderr, "p40_daemon: [%s] pack read failed at (%d,%d)\n", timestamp().c_str(), h.l, h.e);
                 return 1;
             }
             if (::cudaMemcpy((uint8_t*) dev + h.off, b, (size_t) h.bytes, cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
-                std::fprintf(stderr, "p40_daemon: H2D fill failed: %s\n",
+                std::fprintf(stderr, "p40_daemon: [%s] H2D fill failed: %s\n", timestamp().c_str(),
                              ::cudaGetErrorString(::cudaGetLastError()));
                 return 1;
             }
             done += h.bytes;
             if ((done >> 30) != ((done - h.bytes) >> 30))
-                std::fprintf(stderr, "p40_daemon: filled %.2f GiB\r", (double) done / 1073741824.0);
+                std::fprintf(stderr, "p40_daemon: [%s] filled %.2f GiB\r", timestamp().c_str(), (double) done / 1073741824.0);
         }
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr,
-                     "\np40_daemon: VRAM cache: %zu experts, %.2f GiB at %.2f GiB/s (--vram-gib %.1f)\n",
-                     held.size(), (double) used / 1073741824.0, s > 0 ? (double) used / 1073741824.0 / s : 0,
+                     "\np40_daemon: [%s] VRAM cache: %zu experts, %.2f GiB at %.2f GiB/s (--vram-gib %.1f)\n",
+                     timestamp().c_str(), held.size(), (double) used / 1073741824.0, s > 0 ? (double) used / 1073741824.0 / s : 0,
                      a.vram_gib);
-    std::fprintf(stderr, "p40_daemon: geometry %lld layers x %lld experts, slot table %zu; held head (%d,%d) tail (%d,%d)\n",
-                 (long long) nl, (long long) ne, slot.size(), held.empty() ? -1 : held.front().l,
+    std::fprintf(stderr, "p40_daemon: [%s] geometry %lld layers x %lld experts, slot table %zu; held head (%d,%d) tail (%d,%d)\n",
+                 timestamp().c_str(), (long long) nl, (long long) ne, slot.size(), held.empty() ? -1 : held.front().l,
                  held.empty() ? -1 : held.front().e, held.empty() ? -1 : held.back().l,
                  held.empty() ? -1 : held.back().e);
     } else {
-        std::fprintf(stderr, "p40_daemon: file-backed mode (--vram-gib 0): serving pack bytes, no VRAM cache\n");
+        std::fprintf(stderr, "p40_daemon: [%s] file-backed mode (--vram-gib 0): serving pack bytes, no VRAM cache\n", timestamp().c_str());
     }
 
     uint8_t* stage = nullptr;
     if (::cudaHostAlloc(&stage, (size_t) max_blob, cudaHostAllocDefault) != cudaSuccess) {
-        std::fprintf(stderr, "p40_daemon: pinned staging alloc failed: %s\n",
+        std::fprintf(stderr, "p40_daemon: [%s] pinned staging alloc failed: %s\n", timestamp().c_str(),
                      ::cudaGetErrorString(::cudaGetLastError()));
         return 1;
     }
     int srv = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) {
-        std::fprintf(stderr, "p40_daemon: socket() failed\n");
+        std::fprintf(stderr, "p40_daemon: [%s] socket() failed\n", timestamp().c_str());
         return 1;
     }
     ::unlink(a.socket.c_str());
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (a.socket.size() >= sizeof(addr.sun_path)) {
-        std::fprintf(stderr, "p40_daemon: socket path too long\n");
+        std::fprintf(stderr, "p40_daemon: [%s] socket path too long\n", timestamp().c_str());
         return 1;
     }
     std::memcpy(addr.sun_path, a.socket.c_str(), a.socket.size() + 1);
     if (::bind(srv, (sockaddr*) &addr, sizeof(addr)) != 0 || ::listen(srv, 4) != 0) {
-        std::fprintf(stderr, "p40_daemon: bind/listen failed\n");
+        std::fprintf(stderr, "p40_daemon: [%s] bind/listen failed\n", timestamp().c_str());
         return 1;
     }
     // Bulk BLOBs (2+ MB) must never wedge against a pausing peer: 16 MB
@@ -304,8 +313,8 @@ int main(int argc, char** argv) {
     int bigbuf = 16 << 20;
     ::setsockopt(srv, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
     ::setsockopt(srv, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
-    std::fprintf(stderr, "p40_daemon: pack %s, profile %s (%lld pairs), socket %s, device %d\n",
-                 a.pack.c_str(), a.profile.c_str(), (long long) ranked.size(), a.socket.c_str(),
+    std::fprintf(stderr, "p40_daemon: [%s] pack %s, profile %s (%lld pairs), socket %s, device %d\n",
+                 timestamp().c_str(), a.pack.c_str(), a.profile.c_str(), (long long) ranked.size(), a.socket.c_str(),
                  a.device);
     uint64_t gets = 0, hits = 0, misses = 0, served = 0;
     long long trace_n = 0;
@@ -385,7 +394,7 @@ int main(int argc, char** argv) {
                 if (bytes == nullptr || nb == 0) {
                     ++misses;
                     if (trace && trace_n < 200) {
-                        std::fprintf(stderr, "p40d: GET (%lld,%lld) -> MISS\n", (long long) l,
+                        std::fprintf(stderr, "p40d: [%s] GET (%lld,%lld) -> MISS\n", timestamp().c_str(), (long long) l,
                                      (long long) e);
                         ++trace_n;
                     }
@@ -398,7 +407,7 @@ int main(int argc, char** argv) {
                 ++hits;
                 served += nb;
                 if (trace && trace_n < 200) {
-                    std::fprintf(stderr, "p40d: GET (%lld,%lld) -> BLOB %llu B\n", (long long) l,
+                    std::fprintf(stderr, "p40d: [%s] GET (%lld,%lld) -> BLOB %llu B\n", timestamp().c_str(), (long long) l,
                                  (long long) e, (unsigned long long) nb);
                     ++trace_n;
                 }
@@ -443,8 +452,8 @@ int main(int argc, char** argv) {
             }
         }
         ::close(fd);
-        std::fprintf(stderr, "p40_daemon: client done: %llu gets %llu hits %llu misses %.2f GiB served\n",
-                     (unsigned long long) gets, (unsigned long long) hits, (unsigned long long) misses,
+        std::fprintf(stderr, "p40_daemon: [%s] client done: %llu gets %llu hits %llu misses %.2f GiB served\n",
+                     timestamp().c_str(), (unsigned long long) gets, (unsigned long long) hits, (unsigned long long) misses,
                      (double) served / 1073741824.0);
     }
     return 0;
