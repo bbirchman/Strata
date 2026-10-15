@@ -13087,6 +13087,12 @@ int main(int argc, char** argv) {
                                  (double) p40_src.tier_fallback_bytes() / 1e6,
                                  (long long) p40_src.tier_hash_mismatches(),
                                  (long long) p40_src.tier_skipped());
+                else if (srcp == &src && src.valid())
+                    std::fprintf(stderr, "strata serve: P40 tier: %lld blobs from VRAM, %lld misses, %.1f MB fallbacks, %lld hash mismatches, %lld hot-skipped\n",
+                                 (long long) src.tier_hits(), (long long) src.tier_misses(),
+                                 (double) src.tier_fallback_bytes() / 1e6,
+                                 (long long) src.tier_hash_mismatches(),
+                                 (long long) src.tier_skipped());
                 // what the OS did for this request (since the previous one): the drive's share of the file tier's reads
                 // against the page cache's, and what the I/O path did about it
                 static strata::platform::ProcIo io_prev;
