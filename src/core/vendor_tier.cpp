@@ -29,6 +29,7 @@ static_assert((uint32_t) strata::core::pagewire::Op::BYE == 10, "page op numberi
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -465,6 +466,8 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     h->magic = kMagic; h->op = GET; h->len = 16;
     std::memcpy(req + sizeof(Header), &layer, 8);
     std::memcpy(req + sizeof(Header) + 8, &expert, 8);
+    const bool timed = trace_on();
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!send_all(fd_, req, sizeof(req))) {
         if (trace_on() && trace_next() < kTraceCap)
             std::fprintf(stderr, "p40tier: GET (%lld,%lld) send-fail\n", (long long) layer,
@@ -475,6 +478,7 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         std::fprintf(stderr, "p40tier: GET (%lld,%lld) sent\n", (long long) layer, (long long) expert);
     Header rh{};
     if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) return false;
+    const auto t1 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (rh.magic != kMagic || rh.len > kMaxPayload) return false;
     if (rh.op == MISS) {
         __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
@@ -499,6 +503,18 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
     if (rl != layer || re != expert) return false;
     if (!recv_all(fd_, dst, (size_t) want)) return false;
+    if (timed) {
+        const auto t2 = std::chrono::steady_clock::now();
+        const long long first_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        const long long rest_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        static long long n = 0;
+        if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 30)
+            std::fprintf(stderr, "p40tier: perf (%lld,%lld) %llu B: req+reply-header %lld us, meta+blob %lld us\n",
+                         (long long) layer, (long long) expert, (unsigned long long) want,
+                         first_us, rest_us);
+    }
     // Integrity without per-blob hashing: size + address are checked on
     // every blob (framing bugs fail closed); content is proven once per
     // session by sentinel GETs at open() and by the daemon's fill-time
