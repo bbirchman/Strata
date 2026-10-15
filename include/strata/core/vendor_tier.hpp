@@ -19,6 +19,7 @@
 
 #include "strata/core/expert_source.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -131,8 +132,18 @@ private:
                             uint8_t* const* dst, const uint64_t* want,
                             const size_t* idx, size_t m, char* ok) noexcept;
     // Shared dial+HELLO+staging body behind open() and open_tier().
+    // sentinel_proof=false skips the 3-blob content check (reconnect path:
+    // mu_ is already held and fetch_one would self-deadlock; the first
+    // connect's proof still stands for the session).
     bool connect_daemon(const std::string& socket_path, int64_t layers, int64_t experts,
-                        std::string& err);
+                        std::string& err, bool sentinel_proof = true);
+    // close() body with mu_ already held (close() takes it; reconnect does).
+    void close_locked();
+    // Hard-drop a poisoned stream (no BYE): keeps inner_ and the base
+    // mapping, clears tier state. Mu_ already held.
+    void drop_tier_locked();
+    // Re-dial after a drop, throttled (30 s). Mu_ already held. Fail-open.
+    bool try_reconnect_locked();
 
     int fd_ = -1;
     ExpertSource* inner_ = nullptr;  ///< arena-wrap target; null = self mode
@@ -187,6 +198,12 @@ private:
     int64_t tier_fallback_bytes_ = 0, tier_hash_mismatches_ = 0;
     int64_t tier_batches_ = 0;  ///< FETCH_N round trips issued
     int64_t tier_us_ = 0;       ///< us inside daemon round trips (all pairs)
+    int64_t tier_drops_ = 0;    ///< poisoned streams dropped (reconnects after)
+    int64_t tier_reconnects_ = 0;  ///< successful re-dials
+    // Re-dial coordinates (set by connect_daemon; cleared by close()).
+    std::string socket_path_;
+    int64_t cfg_layers_ = 0, cfg_experts_ = 0;
+    std::chrono::steady_clock::time_point last_reconnect_;
     int64_t reads_ = 0;
 };
 

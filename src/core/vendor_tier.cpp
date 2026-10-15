@@ -206,7 +206,12 @@ bool VendorTierSource::open_tier(const std::string& socket_path, int64_t layers,
 }
 
 bool VendorTierSource::connect_daemon(const std::string& socket_path, int64_t layers, int64_t experts,
-                                      std::string& err) {
+                                      std::string& err, bool sentinel_proof) {
+    // Remember for lazy reconnect after a mid-stream failure (drop_tier):
+    // a transient blip must not kill the tier for the session.
+    socket_path_ = socket_path;
+    cfg_layers_ = layers;
+    cfg_experts_ = experts;
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { err = "vendor tier: socket() failed"; return false; }
     // Non-blocking connect with a 3 s deadline: a missing daemon must fail
@@ -350,12 +355,13 @@ bool VendorTierSource::connect_daemon(const std::string& socket_path, int64_t la
             if (!staging_.empty()) staging_bytes_ = mb;
         }
     }
-    // Sentinel verification (startup-only, fail-open): the first 3 daemon-
+    // Sentinel verification (fail-open): the first 3 daemon-
     // held pairs are fetched and compared byte-for-byte against the inner
     // source (the pack). This is the content proof that replaces per-blob
     // hashing: same guarantee for pack identity and transfer integrity at
     // ~6 blobs of one-time cost instead of ~8 ms per hit forever.
-    if (!staging_.empty() && !held.empty()) {
+    // Skipped on reconnect (caller holds mu_; proof from first connect stands).
+    if (sentinel_proof && !staging_.empty() && !held.empty()) {
         int checked = 0, matched = 0;
         for (int64_t l = 0; l < nl && checked < 3; ++l) {
             for (int64_t e = 0; e < ne && checked < 3; ++e) {
@@ -381,6 +387,12 @@ bool VendorTierSource::connect_daemon(const std::string& socket_path, int64_t la
 
 void VendorTierSource::close() {
     std::lock_guard<std::mutex> lock(mu_);
+    close_locked();
+    inner_ = nullptr;
+    socket_path_.clear();
+}
+
+void VendorTierSource::close_locked() {
     if (fd_ >= 0) {
         Header h{kMagic, BYE, 0};
         (void) send_all(fd_, (uint8_t*) &h, sizeof(h));
@@ -396,14 +408,58 @@ void VendorTierSource::close() {
     inner_ = nullptr;
 }
 
+// Drop a poisoned stream WITHOUT BYE (the peer may be wedged; even BYE
+// could block): kernel close delivers FIN/RST so the daemon's next
+// send/recv fails fast and it returns to accept(). Keeps inner_ and the
+// base mapping: the tier degrades to file until try_reconnect_locked().
+void VendorTierSource::drop_tier_locked() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+    for (auto& s : staging_) std::free(s.ptr);
+    staging_.clear();
+    staging_bytes_ = 0;
+    staging_next_ = 0;
+    vram_cached_ = 0;
+    held_bits_.clear();
+    ++tier_drops_;
+    std::fprintf(stderr, "p40tier: transport failure: dropped the daemon connection (fail-open to file)\n");
+}
+
+// Re-dial after a drop (throttled: at most one attempt per 30 s so a dead
+// daemon costs one 3 s connect per half minute, never per miss).
+bool VendorTierSource::try_reconnect_locked() {
+    if (fd_ >= 0 || socket_path_.empty()) return fd_ >= 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_reconnect_ < std::chrono::seconds(30)) return false;
+    last_reconnect_ = now;
+    std::string err;
+    // close_locked() first (no BYE to a dead peer... BYE to a live one is
+    // polite but close_locked sends it; fd_ is -1 here so it only resets
+    // staging state): then a fresh HELLO + bitmap + staging + sentinels.
+    close_locked();
+    if (connect_daemon(socket_path_, cfg_layers_, cfg_experts_, err, /*sentinel_proof=*/false)) {
+        ++tier_reconnects_;
+        std::fprintf(stderr, "p40tier: reconnected to the daemon\n");
+        return true;
+    }
+    std::fprintf(stderr, "p40tier: reconnect failed (%s)\n", err.c_str());
+    return false;
+}
+
 const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lock(mu_);
     // File-backed daemon (or no staging): the inner source is already the
     // fastest path, so delegate. The daemon-first path below only pays when
     // the daemon holds a VRAM cache the host does not have.
+    // Dropped connection: try one throttled re-dial (a transient blip
+    // must not park the tier on file for the rest of the session).
     if (fd_ < 0) {
-        trace_decision("blob", layer, expert, "delegate: no daemon");
-        return fb_blob(layer, expert);
+        if (!try_reconnect_locked()) {
+            trace_decision("blob", layer, expert, "delegate: no daemon");
+            return fb_blob(layer, expert);
+        }
     }
     if (vram_cached_ == 0 || staging_.empty() || staging_bytes_ == 0) {
         trace_decision("blob", layer, expert, "delegate: file-mode/no-staging");
@@ -490,14 +546,21 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         if (trace_on() && trace_next() < kTraceCap)
             std::fprintf(stderr, "p40tier: GET (%lld,%lld) send-fail\n", (long long) layer,
                          (long long) expert);
+        drop_tier_locked();
         return false;
     }
     if (trace_on() && trace_next() < kTraceCap)
         std::fprintf(stderr, "p40tier: GET (%lld,%lld) sent\n", (long long) layer, (long long) expert);
     Header rh{};
-    if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) return false;
+    if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) {
+        drop_tier_locked();
+        return false;
+    }
     const auto t1 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (rh.magic != kMagic || rh.len > kMaxPayload) return false;
+    if (rh.magic != kMagic || rh.len > kMaxPayload) {
+        drop_tier_locked();
+        return false;
+    }
     if (rh.op == MISS) {
         __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
         if (trace_on() && trace_next() < kTraceCap)
@@ -512,15 +575,29 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         // must open the same --pack as the engine.)
         std::vector<uint8_t> drain;
         drain.resize((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
-        if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) return false;
+        if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) {
+            drop_tier_locked();
+            return false;
+        }
         return false;
     }
     uint8_t meta[48];
-    if (!recv_all(fd_, meta, sizeof(meta))) return false;
+    if (!recv_all(fd_, meta, sizeof(meta))) {
+        drop_tier_locked();
+        return false;
+    }
     int64_t rl = 0, re = 0;
     std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
-    if (rl != layer || re != expert) return false;
-    if (!recv_all(fd_, dst, (size_t) want)) return false;
+    // Address mismatch: the daemon answered for another pair; its blob body
+    // is still on the wire -> the stream is desynced. Drop, never continue.
+    if (rl != layer || re != expert) {
+        drop_tier_locked();
+        return false;
+    }
+    if (!recv_all(fd_, dst, (size_t) want)) {
+        drop_tier_locked();
+        return false;
+    }
     if (timed) {
         const auto t2 = std::chrono::steady_clock::now();
         const long long first_us =
@@ -563,6 +640,12 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
 
 bool VendorTierSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (fetch_one(layer, expert, dst)) return true;
+    // One throttled re-dial, then one retry: a dropped stream recovers
+    // inside this call instead of parking on file for 30 s.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (try_reconnect_locked() && fetch_one_locked(layer, expert, dst)) return true;
+    }
     const auto& pl = strata::kernels::cpu::expert_layout();
     bool ok = fb_copy_blob(layer, expert, dst);
     if (ok) __atomic_fetch_add(&tier_fallback_bytes_, (long long) pl.blob_bytes(layer), __ATOMIC_RELAXED);
@@ -592,46 +675,77 @@ bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* 
         req.insert(req.end(), (uint8_t*) &l, (uint8_t*) &l + 8);
         req.insert(req.end(), (uint8_t*) &e, (uint8_t*) &e + 8);
     }
-    if (!send_all(fd_, req.data(), req.size())) return false;
+    if (!send_all(fd_, req.data(), req.size())) {
+        drop_tier_locked();
+        return false;
+    }
     static bool verify = [] {
         const char* e = std::getenv("STRATA_P40_VERIFY");
         return e != nullptr && e[0] == '1';
     }();
     for (size_t k = 0; k < m; ++k) {
         Header rh{};
-        if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) return false;
-        if (rh.magic != kMagic || rh.len > kMaxPayload) return false;
+        if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) {
+            drop_tier_locked();
+            return false;
+        }
+        if (rh.magic != kMagic || rh.len > kMaxPayload) {
+            drop_tier_locked();
+            return false;
+        }
         if (rh.op == ERROR) {
             // Old daemon (pre-FETCH_N): exactly one ERROR frame stands in
             // for the whole batch. Report unsupported: the caller retries
-            // per-pair GETs, which every daemon speaks.
+            // per-pair GETs, which every daemon speaks. Stream stays synced
+            // (the single frame is consumed); no drop unless the drain fails.
             for (size_t j = k; j < m; ++j) ok[idx[j]] = false;
             if (rh.len > 0) {
                 std::vector<uint8_t> drain((size_t) rh.len);
-                (void) recv_all(fd_, drain.data(), drain.size());
+                if (!recv_all(fd_, drain.data(), drain.size())) {
+                    drop_tier_locked();
+                    return false;
+                }
             }
             return k == 0 ? false : true;  // false = retry whole batch per-pair
         }
         if (rh.op == MISS) {
-            if (rh.len != 16) return false;
+            if (rh.len != 16) {
+                drop_tier_locked();
+                return false;
+            }
             uint8_t mm[16];
-            if (!recv_all(fd_, mm, sizeof(mm))) return false;
+            if (!recv_all(fd_, mm, sizeof(mm))) {
+                drop_tier_locked();
+                return false;
+            }
             __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
             ok[idx[k]] = false;
             continue;
         }
         if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want[idx[k]]) {
             std::vector<uint8_t> drain((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
-            if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) return false;
+            if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) {
+                drop_tier_locked();
+                return false;
+            }
             ok[idx[k]] = false;
             continue;
         }
         uint8_t meta[48];
-        if (!recv_all(fd_, meta, sizeof(meta))) return false;
+        if (!recv_all(fd_, meta, sizeof(meta))) {
+            drop_tier_locked();
+            return false;
+        }
         int64_t rl = 0, re = 0;
         std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
-        if (rl != (int64_t) layers[idx[k]] || re != (int64_t) experts[idx[k]]) return false;
-        if (!recv_all(fd_, dst[idx[k]], (size_t) want[idx[k]])) return false;
+        if (rl != (int64_t) layers[idx[k]] || re != (int64_t) experts[idx[k]]) {
+            drop_tier_locked();
+            return false;
+        }
+        if (!recv_all(fd_, dst[idx[k]], (size_t) want[idx[k]])) {
+            drop_tier_locked();
+            return false;
+        }
         if (verify) {
             Sha256 s;
             s.update(dst[idx[k]], (size_t) want[idx[k]]);
@@ -661,57 +775,55 @@ bool VendorTierSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     // straight to the inner source with zero socket cost.
     if (n == 0) return true;
     const auto& pl = strata::kernels::cpu::expert_layout();
-    auto fb = [&](size_t i) -> bool {
-        bool ok = fb_copy_blob(layers[i], experts[i], dst[i]);
-        if (ok) {
-            uint64_t b = 0;
-            try { b = pl.blob_bytes(layers[i]); } catch (...) {}
-            __atomic_fetch_add(&tier_fallback_bytes_, (long long) b, __ATOMIC_RELAXED);
-        }
-        return ok;
-    };
     std::vector<uint64_t> want(n, 0);
     std::vector<size_t> idx;
     idx.reserve(n);
     std::vector<char> batched(n, 0);
-    if (fd_ >= 0) {
-        for (size_t i = 0; i < n; ++i) {
-            int64_t l = layers[i], e = experts[i];
-            if (l < 0 || e < 0 || l >= layers_ || e >= experts_) continue;
-            if (!daemon_holds(l, e)) {
-                __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
-                continue;
+    std::vector<char> ok(n, 0); // char: no vector<bool> bitpacking
+    {
+        // One critical section for partition + all batch round trips: the
+        // socket is one stream and held_bits_/fd_ are shared. The file
+        // fallback below runs OUTSIDE the lock (the base copy re-enters
+        // tier methods: holding mu_ across it deadlocked the engine).
+        std::lock_guard<std::mutex> lock(mu_);
+        // Dropped connection: one throttled re-dial before partitioning.
+        if (fd_ < 0) (void) try_reconnect_locked();
+        if (fd_ >= 0) {
+            for (size_t i = 0; i < n; ++i) {
+                int64_t l = layers[i], e = experts[i];
+                if (l < 0 || e < 0 || l >= layers_ || e >= experts_) continue;
+                if (!daemon_holds(l, e)) {
+                    __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+                    continue;
+                }
+                uint64_t w = 0;
+                try { w = pl.blob_bytes(l); } catch (...) { continue; }
+                if (w == 0 || w > kMaxPayload - 64) continue;
+                want[i] = w;
+                idx.push_back(i);
             }
-            uint64_t w = 0;
-            try { w = pl.blob_bytes(l); } catch (...) { continue; }
-            if (w == 0 || w > kMaxPayload - 64) continue;
-            want[i] = w;
-            idx.push_back(i);
+            for (size_t c = 0; c < idx.size(); c += 64) {
+                size_t m = std::min<size_t>(64, idx.size() - c);
+                // fetch_batch_locked marks ok[]; false = transport broke
+                // (dropped inside: remaining pairs fall back) or an old
+                // daemon (retry per-pair GETs below via the same fallback).
+                if (!fetch_batch_locked(layers, experts, dst, want.data(), idx.data() + c, m,
+                                        ok.data())) {
+                    // Transport broke mid-batch: drop already done inside;
+                    // fall back per-pair below (GETs re-dial throttled).
+                    for (size_t k = 0; k < m; ++k)
+                        if (!ok[idx[c + k]]) batched[idx[c + k]] = 0;
+                }
+                for (size_t k = 0; k < m; ++k) batched[idx[c + k]] = ok[idx[c + k]];
+            }
         }
     }
     bool all = true;
-    if (!idx.empty()) {
-        std::vector<char> ok(n, 0); // char: no vector<bool> bitpacking
-        for (size_t c = 0; c < idx.size(); c += 64) {
-            size_t m = std::min<size_t>(64, idx.size() - c);
-            // Lock only around the batch round trip (the socket is one
-            // stream: frames must never interleave). NEVER hold mu_ across
-            // the fallback below: the base copy re-enters tier methods that
-            // take mu_, and it is non-recursive (first fallback hung).
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                // fetch_batch_locked marks ok[]; false = transport broke or
-                // an old daemon: remaining pairs fall back (per-pair GETs
-                // speak to every daemon), received blobs stay served.
-                (void) fetch_batch_locked(layers, experts, dst, want.data(), idx.data() + c, m,
-                                          ok.data());
-            }
-            for (size_t k = 0; k < m; ++k) batched[idx[c + k]] = ok[idx[c + k]];
-        }
-    }
     for (size_t i = 0; i < n; ++i) {
         if (batched[i]) continue;
-        if (!fb(i)) all = false;
+        // Per-pair GET (speaks to old daemons too) then file. Bytes counted
+        // inside copy_blob; MISS/second-failure just falls back again.
+        if (!copy_blob(layers[i], experts[i], dst[i])) all = false;
     }
     return all;
 }
