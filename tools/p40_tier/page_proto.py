@@ -12,6 +12,7 @@ Ops:
     HELLO=1       {u32 version, u32 namelen, name} -> HELLO_REPLY
     HELLO_REPLY=2 {u32 version, u64 blob_bytes, u64 layers, u64 experts}
     GET=3         {u64 layer, u64 expert} -> BLOB or MISS
+    FETCH_N=12    {u32 n, n x (u64 layer, u64 expert)} -> n BLOB/MISS frames
     BLOB=4        {u64 layer, u64 expert, 32B sha256, blob bytes}
     MISS=5        {u64 layer, u64 expert}
     PREFETCH=6    {u32 n, n x (u64 layer, u64 expert)} -> ACK
@@ -38,7 +39,7 @@ LAYERS = 48
 EXPERTS = 512
 MAX_PAYLOAD = 8 << 20
 
-HELLO, HELLO_REPLY, GET, BLOB, MISS, PREFETCH, ACK, STATS, STATS_REPLY, BYE, ERROR = range(1, 12)
+HELLO, HELLO_REPLY, GET, BLOB, MISS, PREFETCH, ACK, STATS, STATS_REPLY, BYE, ERROR, FETCH_N = range(1, 13)
 
 _HEADER = struct.Struct("<IIQ")
 
@@ -153,6 +154,19 @@ class _Handler(BaseRequestHandler):
                     for i in range(n):
                         store.get(pairs[2 * i], pairs[2 * i + 1])
                     self.request.sendall(encode_frame(ACK, struct.pack("<Q", 0)))
+                elif op == FETCH_N:
+                    (n,) = struct.unpack("<I", payload[:4])
+                    assert 1 <= n <= 64 and len(payload) == 4 + n * 16, "bad FETCH_N"
+                    pairs = struct.unpack(f"<{n * 2}Q", payload[4:])
+                    for i in range(n):
+                        layer, expert = pairs[2 * i], pairs[2 * i + 1]
+                        blob = store.get(layer, expert)
+                        if blob is None:
+                            self.request.sendall(encode_frame(MISS, struct.pack("<QQ", layer, expert)))
+                        else:
+                            self.request.sendall(
+                                encode_frame(BLOB, struct.pack("<QQ", layer, expert) + sha256(blob) + blob)
+                            )
                 elif op == STATS:
                     self.request.sendall(encode_frame(STATS_REPLY, struct.pack("<QQQQ", *store.stats())))
                 elif op == BYE:
@@ -225,6 +239,31 @@ class PageClient:
         op, _ = decode_frame(self.f)
         if op != ACK:
             raise ConnectionError(f"expected ACK, got op {op}")
+
+    def fetch_many(self, pairs) -> list:
+        """One FETCH_N round trip. Returns [(layer, expert, blob|None)]."""
+        pairs = list(pairs)
+        assert 1 <= len(pairs) <= 64, "FETCH_N needs 1..64 pairs"
+        payload = struct.pack("<I", len(pairs))
+        for layer, expert in pairs:
+            payload += struct.pack("<QQ", layer & 0xFFFFFFFFFFFFFFFF, expert & 0xFFFFFFFFFFFFFFFF)
+        self.sock.sendall(encode_frame(FETCH_N, payload))
+        out = []
+        for layer, expert in pairs:
+            op, p = decode_frame(self.f)
+            if op == MISS:
+                out.append((layer, expert, None))
+            elif op == BLOB:
+                rlayer, rexpert = struct.unpack("<QQ", p[:16])
+                digest, blob = p[16:48], p[48:]
+                if (rlayer, rexpert) != (layer & 0xFFFFFFFFFFFFFFFF, expert & 0xFFFFFFFFFFFFFFFF):
+                    raise ConnectionError("blob address mismatch")
+                if sha256(blob) != digest:
+                    raise ConnectionError("blob sha256 mismatch")
+                out.append((layer, expert, blob))
+            else:
+                raise ConnectionError(f"expected BLOB/MISS, got op {op}")
+        return out
 
     def stats(self):
         self.sock.sendall(encode_frame(STATS, b""))

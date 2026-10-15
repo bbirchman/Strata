@@ -28,7 +28,12 @@ enum Op : uint32_t {
     STATS = 8,
     STATS_REPLY = 9,
     BYE = 10,
-    ERROR = 11
+    ERROR = 11,
+    // v1.3 batch: FETCH_N {u32 n, n x (u64 layer, u64 expert)} (1 <= n <= 64)
+    // -> n reply frames (BLOB or MISS each, request order). Lets the engine
+    // amortize one RTT over a whole miss set; unknown to older daemons
+    // (ERROR "unknown op": the engine falls back to per-pair GETs).
+    FETCH_N = 12
 };
 
 #pragma pack(push, 1)

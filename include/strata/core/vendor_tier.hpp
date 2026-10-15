@@ -118,6 +118,14 @@ private:
     // fetch_one with mu_ already held (blob() holds it across slot scan +
     // fetch so two threads can never share a staging slot).
     bool fetch_one_locked(int64_t layer, int64_t expert, uint8_t* dst) noexcept;
+    // One FETCH_N round trip for idx[0..m) (m <= 64), mu_ already held.
+    // ok[idx[k]] = blob received and accepted (hits/misses counted inside).
+    // False = transport broke (received blobs stay served, the rest fall
+    // back) or an old daemon answered ERROR (all false: the caller retries
+    // per-pair GETs, which every daemon speaks).
+    bool fetch_batch_locked(const int32_t* layers, const int32_t* experts,
+                            uint8_t* const* dst, const uint64_t* want,
+                            const size_t* idx, size_t m, char* ok) noexcept;
     // Shared dial+HELLO+staging body behind open() and open_tier().
     bool connect_daemon(const std::string& socket_path, int64_t layers, int64_t experts,
                         std::string& err);

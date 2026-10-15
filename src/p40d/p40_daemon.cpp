@@ -368,12 +368,10 @@ int main(int argc, char** argv) {
                         }
                 }
                 if (!send_frame(fd, (uint32_t) pw::HELLO_REPLY, rep.data(), rep.size())) break;
-            } else if (op == pw::GET) {
+            // One pair lookup + reply. True = stream in sync, keep serving;
+            // false = transport broke, drop the client.
+            auto serve_pair = [&](int64_t l, int64_t e) -> bool {
                 ++gets;
-                if (req.size() != 16) break;
-                int64_t l = 0, e = 0;
-                std::memcpy(&l, req.data(), 8);
-                std::memcpy(&e, req.data() + 8, 8);
                 int32_t s = (l < 0 || e < 0 || l >= nl || e >= ne) ? -1 : slot[(size_t) (l * ne + e)];
                 const uint8_t* bytes = nullptr;
                 uint64_t nb = 0;
@@ -401,8 +399,8 @@ int main(int argc, char** argv) {
                     uint8_t m[16];
                     std::memcpy(m, &l, 8);
                     std::memcpy(m + 8, &e, 8);
-                    if (!send_frame(fd, (uint32_t) pw::MISS, m, sizeof(m))) break;
-                    continue;
+                    if (!send_frame(fd, (uint32_t) pw::MISS, m, sizeof(m))) return false;
+                    return true;
                 }
                 ++hits;
                 served += nb;
@@ -433,7 +431,28 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 8; ++i) frame.push_back(((uint8_t*) &e)[i]);
                 frame.insert(frame.end(), dg.begin(), dg.end());
                 frame.insert(frame.end(), bytes, bytes + (size_t) nb);
-                if (!send_frame(fd, (uint32_t) pw::BLOB, frame.data(), frame.size())) break;
+                if (!send_frame(fd, (uint32_t) pw::BLOB, frame.data(), frame.size())) return false;
+                return true;
+            };
+            if (op == pw::GET) {
+                if (req.size() != 16) break;
+                int64_t l = 0, e = 0;
+                std::memcpy(&l, req.data(), 8);
+                std::memcpy(&e, req.data() + 8, 8);
+                if (!serve_pair(l, e)) break;
+            } else if (op == pw::FETCH_N) {
+                if (req.size() < 4) break;
+                uint32_t n = 0;
+                std::memcpy(&n, req.data(), 4);
+                if (n == 0 || n > 64 || req.size() != 4 + (size_t) n * 16) break;
+                bool ok = true;
+                for (uint32_t i = 0; ok && i < n; ++i) {
+                    int64_t l = 0, e = 0;
+                    std::memcpy(&l, req.data() + 4 + (size_t) i * 16, 8);
+                    std::memcpy(&e, req.data() + 4 + (size_t) i * 16 + 8, 8);
+                    ok = serve_pair(l, e);
+                }
+                if (!ok) break;
             } else if (op == pw::PREFETCH) {
                 // Bytes are resident by construction (VRAM) or pageable
                 // (file mode): nothing to stage, ACK keeps the stream.

@@ -28,6 +28,7 @@ static_assert((uint32_t) strata::core::pagewire::Op::BYE == 10, "page op numberi
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -114,7 +115,8 @@ constexpr uint32_t kMagic = 0x50343054;
 constexpr uint32_t kVersion = 1;
 constexpr uint64_t kMaxPayload = 8ull << 20;
 enum Op : uint32_t { HELLO = 1, HELLO_REPLY = 2, GET = 3, BLOB = 4, MISS = 5,
-                     PREFETCH = 6, ACK = 7, STATS = 8, STATS_REPLY = 9, BYE = 10, ERROR = 11 };
+                     PREFETCH = 6, ACK = 7, STATS = 8, STATS_REPLY = 9, BYE = 10, ERROR = 11,
+                     FETCH_N = 12 };
 
 #pragma pack(push, 1)
 struct Header { uint32_t magic, op; uint64_t len; };
@@ -551,14 +553,141 @@ bool VendorTierSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return ok;
 }
 
+// One FETCH_N round trip for the eligible pairs. ok[i] = blob received and
+// accepted. Returns false only when the stream broke (caller falls back) or
+// the daemon predates FETCH_N (ERROR on the first reply: caller retries the
+// whole set per-pair). mu_ already held (copy_blobs holds it; the socket is
+// one stream: frames must never interleave).
+bool VendorTierSource::fetch_batch_locked(const int32_t* layers, const int32_t* experts,
+                                          uint8_t* const* dst, const uint64_t* want,
+                                          const size_t* idx, size_t m, char* ok) noexcept {
+    if (fd_ < 0 || m == 0 || m > 64) return false;
+    for (size_t k = 0; k < m; ++k) ok[idx[k]] = false;
+    std::vector<uint8_t> req;
+    req.reserve(sizeof(Header) + 4 + m * 16);
+    Header h{kMagic, FETCH_N, (uint64_t)(4 + m * 16)};
+    req.insert(req.end(), (uint8_t*) &h, (uint8_t*) &h + sizeof(h));
+    uint32_t mn = (uint32_t) m;
+    req.insert(req.end(), (uint8_t*) &mn, (uint8_t*) &mn + 4);
+    for (size_t k = 0; k < m; ++k) {
+        int64_t l = layers[idx[k]], e = experts[idx[k]];
+        req.insert(req.end(), (uint8_t*) &l, (uint8_t*) &l + 8);
+        req.insert(req.end(), (uint8_t*) &e, (uint8_t*) &e + 8);
+    }
+    if (!send_all(fd_, req.data(), req.size())) return false;
+    static bool verify = [] {
+        const char* e = std::getenv("STRATA_P40_VERIFY");
+        return e != nullptr && e[0] == '1';
+    }();
+    for (size_t k = 0; k < m; ++k) {
+        Header rh{};
+        if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) return false;
+        if (rh.magic != kMagic || rh.len > kMaxPayload) return false;
+        if (rh.op == ERROR) {
+            // Old daemon (pre-FETCH_N): exactly one ERROR frame stands in
+            // for the whole batch. Report unsupported: the caller retries
+            // per-pair GETs, which every daemon speaks.
+            for (size_t j = k; j < m; ++j) ok[idx[j]] = false;
+            if (rh.len > 0) {
+                std::vector<uint8_t> drain((size_t) rh.len);
+                (void) recv_all(fd_, drain.data(), drain.size());
+            }
+            return k == 0 ? false : true;  // false = retry whole batch per-pair
+        }
+        if (rh.op == MISS) {
+            if (rh.len != 16) return false;
+            uint8_t mm[16];
+            if (!recv_all(fd_, mm, sizeof(mm))) return false;
+            __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
+            ok[idx[k]] = false;
+            continue;
+        }
+        if (rh.op != BLOB || rh.len < 48 || rh.len - 48 != want[idx[k]]) {
+            std::vector<uint8_t> drain((size_t) (rh.len > kMaxPayload ? 0 : rh.len));
+            if (!drain.empty() && !recv_all(fd_, drain.data(), drain.size())) return false;
+            ok[idx[k]] = false;
+            continue;
+        }
+        uint8_t meta[48];
+        if (!recv_all(fd_, meta, sizeof(meta))) return false;
+        int64_t rl = 0, re = 0;
+        std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
+        if (rl != (int64_t) layers[idx[k]] || re != (int64_t) experts[idx[k]]) return false;
+        if (!recv_all(fd_, dst[idx[k]], (size_t) want[idx[k]])) return false;
+        if (verify) {
+            Sha256 s;
+            s.update(dst[idx[k]], (size_t) want[idx[k]]);
+            auto digest = s.final();
+            if (std::memcmp(digest.data(), meta + 16, 32) != 0) {
+                __atomic_fetch_add(&tier_hash_mismatches_, 1, __ATOMIC_RELAXED);
+                ok[idx[k]] = false;
+                continue;
+            }
+        }
+        __atomic_fetch_add(&tier_hits_, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&reads_, 1, __ATOMIC_RELAXED);
+        ok[idx[k]] = true;
+    }
+    if (trace_on() && trace_next() < kTraceCap) {
+        long long good = 0;
+        for (size_t k = 0; k < m; ++k) good += ok[idx[k]] ? 1 : 0;
+        std::fprintf(stderr, "p40tier: FETCH_N %zu pairs -> %lld blobs\n", m, good);
+    }
+    return true;
+}
+
 bool VendorTierSource::copy_blobs(const int32_t* layers, const int32_t* experts,
                                   uint8_t* const* dst, size_t n) {
-    // Per-pair GETs for phase 1 (correctness first; a FETCH_N batch op is
-    // the measured follow-up once the hit path is proven). Falls back per
-    // pair so one daemon MISS never fails the batch.
+    // Batched FETCH_N (one RTT per 64 pairs) with per-pair fallback, so one
+    // daemon MISS never fails the batch. Pairs the daemon cannot hold go
+    // straight to the inner source with zero socket cost.
+    if (n == 0) return true;
+    const auto& pl = strata::kernels::cpu::expert_layout();
+    auto fb = [&](size_t i) -> bool {
+        bool ok = fb_copy_blob(layers[i], experts[i], dst[i]);
+        if (ok) {
+            uint64_t b = 0;
+            try { b = pl.blob_bytes(layers[i]); } catch (...) {}
+            __atomic_fetch_add(&tier_fallback_bytes_, (long long) b, __ATOMIC_RELAXED);
+        }
+        return ok;
+    };
+    std::vector<uint64_t> want(n, 0);
+    std::vector<size_t> idx;
+    idx.reserve(n);
+    std::vector<char> batched(n, 0);
+    if (fd_ >= 0) {
+        for (size_t i = 0; i < n; ++i) {
+            int64_t l = layers[i], e = experts[i];
+            if (l < 0 || e < 0 || l >= layers_ || e >= experts_) continue;
+            if (!daemon_holds(l, e)) {
+                __atomic_fetch_add(&tier_skipped_, 1, __ATOMIC_RELAXED);
+                continue;
+            }
+            uint64_t w = 0;
+            try { w = pl.blob_bytes(l); } catch (...) { continue; }
+            if (w == 0 || w > kMaxPayload - 64) continue;
+            want[i] = w;
+            idx.push_back(i);
+        }
+    }
     bool all = true;
+    if (!idx.empty()) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<char> ok(n, 0); // char: no vector<bool> bitpacking
+        for (size_t c = 0; c < idx.size(); c += 64) {
+            size_t m = std::min<size_t>(64, idx.size() - c);
+            // fetch_batch_locked marks ok[]; false = transport broke or an
+            // old daemon: remaining pairs fall back (per-pair GETs speak to
+            // every daemon), already-received blobs stay served.
+            (void) fetch_batch_locked(layers, experts, dst, want.data(), idx.data() + c, m,
+                                      ok.data());
+            for (size_t k = 0; k < m; ++k) batched[idx[c + k]] = ok[idx[c + k]];
+        }
+    }
     for (size_t i = 0; i < n; ++i) {
-        if (!copy_blob(layers[i], experts[i], dst[i])) all = false;
+        if (batched[i]) continue;
+        if (!fb(i)) all = false;
     }
     return all;
 }

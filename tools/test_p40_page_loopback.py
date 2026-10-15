@@ -64,6 +64,18 @@ class PageLoopbackTest(unittest.TestCase):
         self.assertIsNone(self.client.get(0, 512))
         self.assertIsNone(self.client.get(-1 & 0xFFFFFFFFFFFFFFFF, 0))
 
+    def test_fetch_n_batch_byte_exact(self):
+        from tools.p40_tier.page_proto import FETCH_N  # noqa: F401 (op wired)
+        pairs = [(0, 0), (0, 511), (47, 511), (23, 256), (48, 0), (7, 42)]
+        got = self.client.fetch_many(pairs)
+        self.assertEqual(len(got), len(pairs))
+        for (layer, expert, blob) in got:
+            if layer >= 48:
+                self.assertIsNone(blob)
+            else:
+                self.assertIsNotNone(blob)
+                self.assertEqual(blob, fixture_blob(layer, expert))
+
     def test_prefetch_then_stats(self):
         pairs = [(i, i) for i in range(10)]
         self.client.prefetch(pairs)
