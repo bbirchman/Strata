@@ -325,6 +325,7 @@ int main(int argc, char** argv) {
     for (;;) {
         int fd = ::accept(srv, nullptr, nullptr);
         if (fd < 0) break;
+        std::fprintf(stderr, "p40_daemon: [%s] client connected\n", timestamp().c_str());
         ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bigbuf, sizeof(bigbuf));
         ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bigbuf, sizeof(bigbuf));
         timeval dtv{3600, 0};
