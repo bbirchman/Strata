@@ -597,6 +597,9 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
     // Address mismatch: the daemon answered for another pair; its blob body
     // is still on the wire -> the stream is desynced. Drop, never continue.
     if (rl != layer || re != expert) {
+        std::fprintf(stderr, "p40tier: addr mismatch: asked (%lld,%lld), daemon answered (%lld,%lld), %llu B\n",
+                     (long long) layer, (long long) expert, (long long) rl, (long long) re,
+                     (unsigned long long) want);
         drop_tier_locked("one:addr");
         return false;
     }
