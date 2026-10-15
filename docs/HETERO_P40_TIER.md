@@ -94,3 +94,23 @@ Python round trip per blob.
    tail): expect prefill faster-or-equal, decode equal-or-better, zero
    SSD reads in steady state; greedy-compare rung 4 vs rung 5 for
    coherence (divergence across vendors is expected, garbage is not).
+
+## Measured results (2026-10-14/15, XXS IQ3_XXS, 7800XT + P40 24GB + 32GB DDR5)
+
+- Capacity: **77,624 daemon blobs, 0 misses, 0 hash mismatches** in one run;
+  41K hits / 65 GiB served in another. Transport + capacity proven.
+- Per-hit cost: **~1.5 ms** (~0.7 ms RTT + ~0.8 ms transfer for 1.3–1.9 MB blobs).
+  FETCH_N (v1.3, 64/batch) amortizes the RTT half.
+- Speeds (64K ctx): stock cold 7.7 tok/s; stock warm + gfx1101 hipBLASLt table
+  **15.4 tok/s**; tiered 11–13 short runs, 7.4 tok/s over 2000 tokens (no crash
+  at `--vram-reserve-mib 6144`). Tierless A/B same budget: ~5.7 (tier ≈ 2x).
+- Failure modes found & fixed: 30 s daemon timeout vs 60 s engine load
+  (→3600 s); stale engine binary (unconditional hash); build break
+  (subclass hid base `open`); copy_blobs mutex deadlock; poisoned-stream
+  desync (drop + throttled reconnect); 26 GB budget → swap (box: 31 GB,
+  ~8 OS); stock VRAM cliff (506 MB free → paging → #29/#267 crashes).
+- Upstream docs confirm the cliff (DETAILS.md: 91→3 tok/s, 60 s watchdog)
+  and the P40-as-compute alternative (OLDER_GPUS.md: 30–38 tok/s decode).
+- Conclusion: tier pays at 256K capacity (0 misses where SSD faults would
+  dominate), not 64K speed (page cache ≈ 0.2 ms beats P40 ≈ 1.5 ms).
+  30 tok/s needs decode batching + NVIDIA backend or P40-as-compute.
