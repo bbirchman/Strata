@@ -140,8 +140,9 @@ private:
     // close() body with mu_ already held (close() takes it; reconnect does).
     void close_locked();
     // Hard-drop a poisoned stream (no BYE): keeps inner_ and the base
-    // mapping, clears tier state. Mu_ already held.
-    void drop_tier_locked();
+    // mapping, clears tier state. Mu_ already held. `why` + errno name the
+    // failure in the log (no more blind drops).
+    void drop_tier_locked(const char* why = nullptr);
     // Re-dial after a drop, throttled (30 s). Mu_ already held. Fail-open.
     bool try_reconnect_locked();
 
