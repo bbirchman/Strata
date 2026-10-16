@@ -98,6 +98,7 @@ public:
     void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
+                    uint8_t* const* dst, size_t n) override;
     /// het-p40-tier COMPUTE (opt-in): one COMPUTE_N per token for
     /// entries[0..m) of one layer. done[i] set per daemon-computed
     /// entry; false entries stay CPU. False return = transport break
@@ -106,7 +107,6 @@ public:
                         int64_t n_ff, const int32_t* ids, const int64_t* toks,
                         int64_t m, int64_t n_tok, const float* xf, float* out,
                         char* done) noexcept;
-                    uint8_t* const* dst, size_t n) override;
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
     bool warms() const override { return valid() || FileExpertSource::warms(); }
