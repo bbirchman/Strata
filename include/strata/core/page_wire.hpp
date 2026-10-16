@@ -33,7 +33,14 @@ enum Op : uint32_t {
     // -> n reply frames (BLOB or MISS each, request order). Lets the engine
     // amortize one RTT over a whole miss set; unknown to older daemons
     // (ERROR "unknown op": the engine falls back to per-pair GETs).
-    FETCH_N = 12
+    FETCH_N = 12,
+    // v1.4 compute: COMPUTE_N {u32 n, u32 n_embd, u32 n_ff, u32 gu_type, u32 d_type,
+    //   n x (u64 layer, u64 expert), q8_0 act ((n_embd/32)*34 B, single token)}
+    // -> n reply frames (COMPUTE_REPLY {u64 l, u64 e, float[n_embd]} or MISS each,
+    // request order). Daemon computes via moe_hit_grouped_s2; engine falls back
+    // to GETs on ERROR/timeout/mismatch. n in 1..64, q8_0 matches the R4 tier contract.
+    COMPUTE_N = 13,
+    COMPUTE_REPLY = 14
 };
 
 #pragma pack(push, 1)

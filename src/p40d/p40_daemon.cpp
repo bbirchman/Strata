@@ -30,6 +30,8 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/page_wire.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <cuda_runtime.h>
 
@@ -448,6 +450,140 @@ int main(int argc, char** argv) {
                 if (!send_frame(fd, (uint32_t) pw::BLOB, frame.data(), frame.size())) return false;
                 return true;
             };
+
+            // het-p40-tier COMPUTE_N: grouped expert compute on daemon VRAM.
+            // v1: single token; pairs grouped by layer (uniform blob_bytes per
+            // kernel call); blobs gathered D2D into a uniform arena; replies
+            // in request order (COMPUTE_REPLY or MISS each). Any transport or
+            // CUDA failure -> false (caller breaks: stream stays synced, the
+            // engine falls back to GETs). MISS legs drain via engine discipline.
+            auto serve_compute = [&](const std::vector<uint8_t>& rq) -> bool {
+                // v2: native_expert_grouped (native IQ layouts) + q8_1 input.
+                // Req: {u32 n, u32 layer, u32 n_embd, u32 n_ff, u32 gu, u32 d,
+                //   n x (u64 l, u64 e; l must == layer), q8_1 act ((n_embd/32)*36 B)}.
+                // Replies per pair in order (COMPUTE_REPLY or MISS). Validation
+                // trouble -> ERROR + stay connected (engine falls back to GETs);
+                // CUDA trouble -> false (drop; stream may be poisoned).
+                auto errstay = [&](const char* why) -> bool {
+                    std::fprintf(stderr, "p40d: COMPUTE reject: %s (rq=%zu)\n", why, rq.size());
+                    const char* m = "compute unsupported";
+                    return send_frame(fd, (uint32_t)pw::ERROR, (const uint8_t*)m, 17); };
+                if (rq.size() < 24) return false;
+                uint32_t n = 0, layer = 0, n_embd = 0, n_ff = 0, gu = 0, dt = 0;
+                std::memcpy(&n, rq.data(), 4); std::memcpy(&layer, rq.data() + 4, 4);
+                std::memcpy(&n_embd, rq.data() + 8, 4); std::memcpy(&n_ff, rq.data() + 12, 4);
+                std::memcpy(&gu, rq.data() + 16, 4); std::memcpy(&dt, rq.data() + 20, 4);
+                if (n == 0 || n > 64 || n_embd == 0 || n_embd > 8192 || (n_embd % 32) != 0 ||
+                    n_ff == 0 || n_ff > 32768 || gu > 64 || dt > 64) return errstay("ranges");
+                size_t actb = (size_t)(n_embd / 32) * 36;
+                if (rq.size() != 24 + (size_t)n * 16 + actb) return errstay("size");
+                if (!strata::kernels::native_expert_supported((int)gu, (int)dt, (int64_t)n_embd,
+                                                              (int64_t)n_ff)) return errstay("supported");
+                strata::kernels::NativeExpertLayout L =
+                    strata::kernels::native_expert_layout((int)gu, (int)dt, (int64_t)n_embd, (int64_t)n_ff);
+                {
+                    strata::kernels::cpu::NativeFmt F;
+                    std::string ferr;
+                    bool fok = strata::kernels::cpu::native_fmt((int)gu, (int)dt, (int64_t)n_embd,
+                                                                (int64_t)n_ff, F, ferr);
+                    static bool once2 = false;
+                    if (!once2) {
+                        once2 = true;
+                        std::fprintf(stderr, "p40d: fmt gu_row=%zu/%zu d_row=%zu/%zu up=%zu/%zu down=%zu/%zu bytes=%zu/%zu %s\n",
+                                     L.gu_row, fok ? F.gu_row : 0, L.d_row, fok ? F.d_row : 0,
+                                     (size_t)0, fok ? F.up_off : 0, (size_t)0, fok ? F.down_off : 0,
+                                     L.bytes, fok ? F.bytes : 0, fok ? "FOK" : ferr.c_str());
+                    }
+                }
+                {
+                    uint64_t bb = pl.blob_bytes((int64_t)layer);
+                    static bool once = false;
+                    if (!once) {
+                        once = true;
+                        std::fprintf(stderr, "p40d: layout bytes=%zu blob_bytes=%llu gu=%u d=%u embd=%u ff=%u\n",
+                                     L.bytes, (unsigned long long)bb, gu, dt, n_embd, n_ff);
+                    }
+                }
+                static cudaStream_t cs = nullptr;
+                static uint8_t *xq_d = nullptr, *out_d = nullptr;
+                static unsigned long long* gp_d = nullptr;
+                static int32_t *gs_d = nullptr, *ng_d = nullptr, *ed_d = nullptr, *et_d = nullptr;
+                static void* scratch = nullptr; static size_t scratch_n = 0;
+                if (cs == nullptr) {
+                    if (::cudaStreamCreate(&cs) != cudaSuccess) return false;
+                    if (::cudaMalloc(&xq_d, (size_t)(8192 / 32) * 36) != cudaSuccess) return false;
+                    if (::cudaMalloc(&out_d, (size_t)64 * (size_t)8192 * 4) != cudaSuccess) return false;
+                    if (::cudaMalloc(&gp_d, (size_t)64 * 8) != cudaSuccess) return false;
+                    if (::cudaMalloc(&gs_d, (size_t)65 * 4) != cudaSuccess) return false;
+                    if (::cudaMalloc(&ng_d, (size_t)4) != cudaSuccess) return false;
+                    if (::cudaMalloc(&ed_d, (size_t)64 * 4) != cudaSuccess) return false;
+                    if (::cudaMalloc(&et_d, (size_t)64 * 4) != cudaSuccess) return false;
+                }
+                size_t need = strata::kernels::native_expert_scratch_bytes(64, (int64_t)n_ff);
+                if (need > scratch_n) {
+                    if (scratch != nullptr) ::cudaFree(scratch);
+                    if (::cudaMalloc(&scratch, need) != cudaSuccess) { scratch = nullptr; scratch_n = 0; return false; }
+                    scratch_n = need;
+                }
+                if (::cudaMemcpyAsync(xq_d, rq.data() + 24 + (size_t)n * 16, actb, cudaMemcpyHostToDevice, cs) !=
+                    cudaSuccess) return false;
+                std::vector<unsigned long long> gp(n); std::vector<int32_t> ed(n), et(n, 0);
+                std::vector<int64_t> rl(n, 0), re(n, 0); std::vector<char> is_miss(n, 0);
+                size_t m = 0;
+                for (size_t k = 0; k < n; ++k) {
+                    int64_t l = 0, e = 0;
+                    std::memcpy(&l, rq.data() + 24 + k * 16, 8);
+                    std::memcpy(&e, rq.data() + 24 + k * 16 + 8, 8);
+                    rl[k] = l; re[k] = e;
+                    if (l != (int64_t)layer) return errstay("layer");
+                    int32_t sl = (l < 0 || e < 0 || l >= nl || e >= ne) ? -1 : slot[(size_t)(l * ne + e)];
+                    if (sl < 0) { is_miss[k] = 1; continue; }
+                    gp[m] = (unsigned long long)(dev + held[(size_t)sl].off);
+                    ed[m] = (int32_t)m; ++m;
+                }
+                if (m > 0) {
+                    int32_t gs[2] = {0, (int32_t)m}, ng = 1;
+                    if (::cudaMemcpyAsync(gp_d, gp.data(), m * 8, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(gs_d, gs, 8, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(ng_d, &ng, 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(ed_d, ed.data(), m * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(et_d, et.data(), m * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    strata::kernels::native_expert_grouped(
+                        L, gp_d, gs_d, ng_d, ed_d, et_d, 1, (int64_t)m, xq_d, scratch,
+                        (float*)out_d, (void*)cs, 0);
+                    if (::cudaGetLastError() != cudaSuccess) return false;
+                    if (::cudaStreamSynchronize(cs) != cudaSuccess) return false;
+                }
+                std::vector<uint8_t> outh(n * (size_t)n_embd * 4, 0);
+                if (m > 0 &&
+                    ::cudaMemcpy(outh.data(), out_d, m * (size_t)n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+                    return false;
+                for (size_t k = 0, r = 0; k < n; ++k) {
+                    if (is_miss[k]) {
+                        ++misses;
+                        uint8_t mm[16];
+                        std::memcpy(mm, &rl[k], 8); std::memcpy(mm + 8, &re[k], 8);
+                        if (!send_frame(fd, (uint32_t)pw::MISS, mm, sizeof(mm))) return false;
+                        continue;
+                    }
+                    ++gets; ++hits;
+                    std::vector<uint8_t> fr;
+                    fr.reserve(16 + (size_t)n_embd * 4);
+                    for (int b = 0; b < 8; ++b) fr.push_back(((uint8_t*)&rl[k])[b]);
+                    for (int b = 0; b < 8; ++b) fr.push_back(((uint8_t*)&re[k])[b]);
+                    fr.insert(fr.end(), outh.data() + r * (size_t)n_embd * 4,
+                              outh.data() + (r + 1) * (size_t)n_embd * 4);
+                    ++r;
+                    if (trace && trace_n < 200) {
+                        std::fprintf(stderr, "p40d: [%s] COMPUTE (%lld,%lld) -> %llu B out\n",
+                                     timestamp().c_str(), (long long)rl[k], (long long)re[k],
+                                     (unsigned long long)((size_t)n_embd * 4));
+                        ++trace_n;
+                    }
+                    if (!send_frame(fd, (uint32_t)pw::COMPUTE_REPLY, fr.data(), fr.size())) return false;
+                }
+                return true;
+            };
             if (op == pw::GET) {
                 if (req.size() != 16) break;
                 int64_t l = 0, e = 0;
@@ -479,6 +615,8 @@ int main(int argc, char** argv) {
                 if (!send_frame(fd, (uint32_t) pw::STATS_REPLY, rep.data(), rep.size())) break;
             } else if (op == pw::BYE) {
                 break;
+            } else if (op == pw::COMPUTE_N) {
+                if (!serve_compute(req)) break;
             } else {
                 const char* m = "unknown op";
                 if (!send_frame(fd, (uint32_t) pw::ERROR, (const uint8_t*) m, 10)) break;
