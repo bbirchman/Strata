@@ -6,6 +6,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/core/vendor_tier.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -3876,6 +3877,57 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+        }
+    }
+    if (true) {
+        // het-p40-tier COMPUTE (opt-in STRATA_P40_COMPUTE=1): tier-held CPU
+        // misses compute on P40; done rows marked kind=2 (combine reads rows
+        // regardless of who computed). Transport break: kinds untouched (CPU).
+        static const int cgate = [] {
+            const char* e = std::getenv("STRATA_P40_COMPUTE");
+            return (e != nullptr && e[0] == '1') ? 1 : 0;
+        }();
+        if (cgate && d.src != nullptr) {
+            if (auto* tier = dynamic_cast<strata::core::VendorTierSource*>(d.src)) {
+                if (tier->valid()) {
+                    const auto& cray = strata::kernels::cpu::expert_layout();
+                    if (!cray.fmt.empty() && d.layers >= 0 &&
+                        d.layers < (int64_t) cray.fmt.size()) {
+                        const auto& F = cray.fmt[(size_t) d.layers];
+                        static thread_local std::vector<int32_t> cids;
+                        static thread_local std::vector<int64_t> ctoks, cidx;
+                        static thread_local std::vector<char> cdone;
+                        static thread_local std::vector<float> ctmp;
+                        cids.clear(); ctoks.clear(); cidx.clear();
+                        for (int64_t i = 0; i < n; ++i) {
+                            if (kind[i] != -1) continue;
+                            int32_t e = ids[i];
+                            if (e < 0 || e >= d.n_expert) continue;
+                            if (!tier->daemon_holds(d.layers, e)) continue;
+                            cidx.push_back(i);
+                            cids.push_back(e);
+                            ctoks.push_back(i / k);
+                        }
+                        int64_t m = (int64_t) cids.size();
+                        if (m > 0) {
+                            ctmp.assign((size_t) m * (size_t) F.n_embd, 0.0f);
+                            cdone.assign((size_t) m, 0);
+                            if (tier->compute_window(d.layers, F.gu_type, F.d_type, F.n_embd, F.n_ff,
+                                                     cids.data(), ctoks.data(), m, n_tok, x_f,
+                                                     ctmp.data(), cdone.data())) {
+                                for (int64_t c = 0; c < m; ++c) {
+                                    if (!cdone[(size_t) c]) continue;
+                                    int64_t i = cidx[(size_t) c];
+                                    std::memcpy(out + (size_t) i * (size_t) F.n_embd,
+                                                ctmp.data() + (size_t) c * (size_t) F.n_embd,
+                                                (size_t) F.n_embd * 4);
+                                    kind[i] = 2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();

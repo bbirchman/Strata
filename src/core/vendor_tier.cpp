@@ -693,6 +693,108 @@ void quantize_q8_1_cpu(const float* x, uint8_t* y, int64_t n) noexcept {
 }
 }  // namespace
 
+bool VendorTierSource::compute_window(int64_t layer, int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
+                                      const int32_t* ids, const int64_t* toks, int64_t m,
+                                      int64_t n_tok, const float* xf, float* out, char* done) noexcept {
+    for (int64_t i = 0; i < m; ++i) done[i] = 0;
+    if (m <= 0) return true;
+    if (n_embd <= 0 || n_embd > 8192 || (n_embd % 32) != 0 || n_ff <= 0 || n_ff > 32768 ||
+        n_tok <= 0 || n_tok > 64 || gu_type < 0 || gu_type > 64 || d_type < 0 || d_type > 64)
+        return true;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (fd_ < 0) return true;
+    TierTimer _tt(&tier_us_);
+    size_t actb = (size_t) (n_embd / 32) * 36;
+    std::vector<uint8_t> xq(actb);
+    std::vector<uint8_t> req;
+    req.reserve(24 + (size_t) 64 * 16 + actb);
+    std::vector<size_t> idx;
+    idx.reserve(64);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        idx.clear();
+        for (int64_t i = 0; i < m && (int64_t) idx.size() < 64; ++i)
+            if (toks[i] == t) idx.push_back((size_t) i);
+        if (idx.empty()) continue;
+        quantize_q8_1_cpu(xf + (size_t) t * (size_t) n_embd, xq.data(), n_embd);
+        req.clear();
+        req.push_back((uint8_t) idx.size());
+        req.push_back(0); req.push_back(0); req.push_back(0);
+        auto pu32 = [&](uint32_t x) {
+            req.push_back((uint8_t) x); req.push_back((uint8_t) (x >> 8));
+            req.push_back((uint8_t) (x >> 16)); req.push_back((uint8_t) (x >> 24));
+        };
+        pu32((uint32_t) layer); pu32((uint32_t) n_embd);
+        pu32((uint32_t) n_ff); pu32((uint32_t) gu_type); pu32((uint32_t) d_type);
+        for (size_t k : idx) {
+            int64_t l = layer; int32_t e = ids[k];
+            for (int b = 0; b < 8; ++b) req.push_back(((uint8_t*) &l)[b]);
+            for (int b = 0; b < 8; ++b) req.push_back(((uint8_t*) &e)[b]);
+        }
+        req.insert(req.end(), xq.begin(), xq.end());
+        uint8_t rhb[sizeof(Header) + 16];
+        Header* hh = (Header*) rhb;
+        hh->magic = kMagic; hh->op = COMPUTE_N; hh->len = (uint64_t) req.size();
+        if (!send_all(fd_, (uint8_t*) hh, sizeof(Header)) || !send_all(fd_, req.data(), req.size())) {
+            drop_tier_locked("compute:send");
+            return false;
+        }
+        for (size_t k : idx) {
+            Header rh{};
+            if (!recv_all(fd_, (uint8_t*) &rh, sizeof(rh))) {
+                drop_tier_locked("compute:recv-hdr");
+                return false;
+            }
+            if (rh.magic != kMagic || rh.len > kMaxPayload) {
+                drop_tier_locked("compute:bad-hdr");
+                return false;
+            }
+            if (rh.op == ERROR) {
+                std::vector<uint8_t> drain((size_t) rh.len);
+                if (rh.len > 0 && !recv_all(fd_, drain.data(), drain.size())) {
+                    drop_tier_locked("compute:err-drain");
+                    return false;
+                }
+                return true;
+            }
+            if (rh.op == MISS) {
+                if (rh.len != 16) {
+                    drop_tier_locked("compute:miss-len");
+                    return false;
+                }
+                uint8_t mm[16];
+                if (!recv_all(fd_, mm, sizeof(mm))) {
+                    drop_tier_locked("compute:miss-body");
+                    return false;
+                }
+                continue;
+            }
+            if (rh.op != COMPUTE_REPLY || rh.len != 16 + (uint64_t) n_embd * 4) {
+                drop_tier_locked("compute:bad-op");
+                return false;
+            }
+            uint8_t meta[16];
+            if (!recv_all(fd_, meta, sizeof(meta))) {
+                drop_tier_locked("compute:meta");
+                return false;
+            }
+            int64_t rl = 0, re = 0;
+            std::memcpy(&rl, meta, 8); std::memcpy(&re, meta + 8, 8);
+            if (rl != layer || re != (int64_t) ids[k]) {
+                drop_tier_locked("compute:addr");
+                return false;
+            }
+            if (!recv_all(fd_, (uint8_t*) (out + k * n_embd), (size_t) n_embd * 4)) {
+                drop_tier_locked("compute:body");
+                return false;
+            }
+            __atomic_fetch_add(&tier_hits_, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&reads_, 1, __ATOMIC_RELAXED);
+            done[k] = 1;
+        }
+    }
+    return true;
+}
+
 bool VendorTierSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (fetch_one(layer, expert, dst)) return true;
     // One throttled re-dial, then one retry: a dropped stream recovers
