@@ -568,6 +568,8 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
         return false;
     }
     if (rh.op == MISS) {
+        uint8_t mm[16];
+        if (rh.len == 16 && !recv_all(fd_, mm, sizeof(mm))) { drop_tier_locked("one:miss-drain"); return false; }  // het-p40-tier fix: drain MISS body
         __atomic_fetch_add(&tier_misses_, 1, __ATOMIC_RELAXED);
         if (trace_on() && trace_next() < kTraceCap)
             std::fprintf(stderr, "p40tier: GET (%lld,%lld) -> MISS\n", (long long) layer,

@@ -369,7 +369,9 @@ int main(int argc, char** argv) {
                         }
                 }
                 if (!send_frame(fd, (uint32_t) pw::HELLO_REPLY, rep.data(), rep.size())) break;
+                continue;  // het-p40-tier fix: HELLO must not fall into the GET/else chain (stale ERROR)
             }
+
             // One pair lookup + reply. True = stream in sync, keep serving;
             // false = transport broke, drop the client.
             auto serve_pair = [&](int64_t l, int64_t e) -> bool {
