@@ -116,7 +116,7 @@ constexpr uint32_t kVersion = 1;
 constexpr uint64_t kMaxPayload = 8ull << 20;
 enum Op : uint32_t { HELLO = 1, HELLO_REPLY = 2, GET = 3, BLOB = 4, MISS = 5,
                      PREFETCH = 6, ACK = 7, STATS = 8, STATS_REPLY = 9, BYE = 10, ERROR = 11,
-                     FETCH_N = 12 };
+                     FETCH_N = 12, COMPUTE_N = 13, COMPUTE_REPLY = 14 };
 
 #pragma pack(push, 1)
 struct Header { uint32_t magic, op; uint64_t len; };
@@ -648,6 +648,50 @@ bool VendorTierSource::fetch_one_locked(int64_t layer, int64_t expert, uint8_t* 
                      (long long) expert, (unsigned long long) want);
     return true;
 }
+
+namespace {
+// ggml block_q8_1 rule (matches quantize_q8_1_rows bytes): d = max/127,
+// s = (sum of quants)*d, RNE fp16; layout [d | 32x qs | s].
+uint16_t q8_f16(float f) noexcept {
+    uint32_t u; std::memcpy(&u, &f, 4);
+    uint32_t sgn = (u >> 16) & 0x8000;
+    int e = (int) ((u >> 23) & 255) - 112;
+    uint32_t m = u & 0x7FFFFF;
+    if (e <= 0) return (uint16_t) sgn;
+    if (e >= 31) return (uint16_t) (sgn | 0x7BFF);
+    uint32_t r = m + 0xFFF + ((m >> 13) & 1);
+    if (r >= 0x7FF000) return (uint16_t) (sgn | 0x7BFF);
+    return (uint16_t) (sgn | ((uint32_t) e << 10) | (r >> 13));
+}
+void quantize_q8_1_cpu(const float* x, uint8_t* y, int64_t n) noexcept {
+    for (int64_t b = 0; b < n / 32; ++b) {
+        float mx = 0;
+        for (int i = 0; i < 32; ++i) {
+            float a = x[b * 32 + i] < 0 ? -x[b * 32 + i] : x[b * 32 + i];
+            if (a > mx) mx = a;
+        }
+        float d = mx / 127.0f;
+        uint16_t dh, sh;
+        if (d == 0.0f) {
+            dh = 0; sh = 0;
+            std::memset(y + b * 36 + 2, 0, 32);
+        } else {
+            dh = q8_f16(d);
+            int64_t qs = 0;
+            for (int i = 0; i < 32; ++i) {
+                int q = (int) (x[b * 32 + i] / d + (x[b * 32 + i] >= 0 ? 0.5f : -0.5f));
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                y[b * 36 + 2 + i] = (uint8_t) (int8_t) q;
+                qs += q;
+            }
+            sh = q8_f16((float) qs * d);
+        }
+        y[b * 36] = (uint8_t) dh; y[b * 36 + 1] = (uint8_t) (dh >> 8);
+        y[b * 36 + 34] = (uint8_t) sh; y[b * 36 + 35] = (uint8_t) (sh >> 8);
+    }
+}
+}  // namespace
 
 bool VendorTierSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (fetch_one(layer, expert, dst)) return true;
