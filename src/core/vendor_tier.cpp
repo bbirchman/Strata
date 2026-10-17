@@ -510,6 +510,10 @@ const uint8_t* VendorTierSource::blob(int64_t layer, int64_t expert) {
     return fb_blob(layer, expert);
 }
 
+bool VendorTierSource::transient(int64_t layer, int64_t expert) const {
+    return valid() && daemon_holds(layer, expert);
+}
+
 void VendorTierSource::note_async_read(const uint8_t* blob, void* stream) {
     std::lock_guard<std::mutex> lock(mu_);
     for (auto& s : staging_) {

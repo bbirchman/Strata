@@ -92,9 +92,19 @@ public:
     // drives (0 GETs across whole XXS sessions proved it). Same daemon-first
     // logic as blob(); staging slots are stream-guarded by note_async_read,
     // so a recycled slot is never handed out while a DMA still reads it.
-    // Callers that copy immediately (fills, stagers) are unaffected by
-    // recycling; long holders are covered by the busy guard.
+    // Callers that copy immediately (fills) are unaffected by recycling; long holders are covered by the
+    // busy guard. NOTE: the prefill stager does NOT copy immediately - it queues ~508 of these per layer
+    // before Stager::work() runs - so it must go through transient() below, not this.
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override { return blob(layer, expert); }
+    // blob() hands out a pointer into the 64-slot staging ring (kStagingSlots), which the NEXT fetch
+    // overwrites. There is no note_async_read() guard for a plain host-side copy, and the prefill queues
+    // ~508 of these pointers per layer (prefill.cpp:2394-2419) before Stager::work dereferences them, so
+    // experts were aliased onto each other's weights - measured 192 of 508 at layer 0, 43 of them
+    // differing from the file source, which is what produced the #879 tail-NaN at STREAM_MIN.
+    // True routes prefill through Job::from + copy_blobs(): the source writes straight into the stager's
+    // own pinned buffer at copy time, so no pointer outlives the call - and it drops one 1.87 MB memcpy
+    // per expert. File-backed blobs (daemon_holds false) keep the fast memcpy path.
+    bool transient(int64_t layer, int64_t expert) const override;
     void note_async_read(const uint8_t* blob, void* stream) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts,
