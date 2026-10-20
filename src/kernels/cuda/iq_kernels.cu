@@ -271,15 +271,30 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
+// A variant: same PRMT sequence, but the 4 table words are compile-time constants (immediate PRMT
+// operands, no dependent global load of kvalues_iq4nl). Bitwise-identical to the original form.
+__device__ __forceinline__ int2 get_int_from_table_16_imm(const int& q4, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low = __byte_perm(t0, t1, q4 >> shift);
+        const uint32_t high = __byte_perm(t2, t3, q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+}
 __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                      const int& kbx, const int& iqs) {
     const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
     const int* q8 = (const int*) bq8_1->qs + iqs;
     int sumi = 0;
+    // A: compile-time table words -> PRMT operands are immediates, no global load of kvalues_iq4nl.
+    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
 #pragma unroll
     for (int l = 0; l < 2; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        const int2 v = get_int_from_table_16_imm(aux_q4, t0, t1, t2, t3);
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }

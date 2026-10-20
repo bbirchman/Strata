@@ -31,6 +31,7 @@
 #include "strata/core/page_wire.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include <cuda_fp16.h>
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <cuda_runtime.h>
@@ -45,6 +46,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -85,6 +88,14 @@ bool send_frame(int fd, uint32_t op, const uint8_t* payload, size_t len) {
     pw::Header h{pw::kMagic, op, (uint64_t) len};
     return send_all(fd, (uint8_t*) &h, sizeof(h)) && (len == 0 || send_all(fd, payload, len));
 }
+
+// --- T9 scratch instrumentation (env-gated; default path unchanged) ---
+static bool t9_on(const char* k) { const char* v = std::getenv(k); return v && *v && *v != '0'; }
+static double t9_us() {
+    return std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+extern "C" void p40_f32_to_f16(const float*, __half*, int, cudaStream_t);
 bool recv_frame(int fd, uint32_t& op, std::vector<uint8_t>& payload) {
     pw::Header h{};
     if (!recv_all(fd, (uint8_t*) &h, sizeof(h))) return false;
@@ -194,6 +205,54 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
 
 }  // namespace
 
+// ---- C8 B: IQ4_NL -> Q4_0 repack of the down half (byte-neutral: both 4.5 bpw / 18 B per 32 values).
+static bool repack_layer_enabled(int32_t layer) {
+    const char* env = ::getenv("STRATA_C8_B_LAYER");
+    if (env == nullptr || env[0] == '\0') return false;
+    std::string s = env;
+    size_t pos = 0;
+    while (true) {
+        size_t comma = s.find(',', pos);
+        std::string tok = (comma == std::string::npos) ? s.substr(pos) : s.substr(pos, comma - pos);
+        if (!tok.empty() && std::atoi(tok.c_str()) == layer) return true;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+static void repack_down_iq4nl_to_q4_0(uint8_t* blob, const strata::kernels::cpu::ExpertLayout& pl, int32_t layer) {
+    if (layer >= (int32_t) pl.fmt.size()) return;
+    const strata::kernels::cpu::NativeFmt& f = pl.fmt[layer];
+    if (f.d_type != 20) return;  // only IQ4_NL -> Q4_0
+    const int n_embd = (int) f.n_embd;
+    const int n_ff = (int) f.n_ff;
+    const size_t drow = f.d_row;
+    const size_t down_off = f.down_off;
+    const int blocks = n_ff / 32;
+    static const int8_t kv[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    for (int r = 0; r < n_embd; ++r) {
+        uint8_t* row = blob + down_off + (size_t) r * drow;
+        for (int blk = 0; blk < blocks; ++blk) {
+            uint8_t* b = row + blk * 18;
+            float d = __half2float(*(__half*) b);
+            float v[32];
+            for (int j = 0; j < 16; ++j) {
+                v[j]     = d * (float) kv[b[2 + j] & 0x0F];
+                v[j + 16] = d * (float) kv[b[2 + j] >> 4];
+            }
+            float amax = 0.f;
+            for (int j = 0; j < 32; ++j) { float a = fabsf(v[j]); if (a > amax) amax = a; }
+            float d2 = (amax > 0.f) ? (amax / 8.0f) : 1.0f;
+            __half h2 = __float2half_rn(d2);
+            memcpy(b, &h2, 2);
+            for (int j = 0; j < 16; ++j) {
+                int c0 = (int)(v[j]     / d2 + 8.5f); if (c0 < 0) c0 = 0; if (c0 > 15) c0 = 15;
+                int c1 = (int)(v[j + 16] / d2 + 8.5f); if (c1 < 0) c1 = 0; if (c1 > 15) c1 = 15;
+                b[2 + j] = (uint8_t)(c0 | (c1 << 4));
+            }
+        }
+    }
+}
 int main(int argc, char** argv) {
     Args a;
     std::string err;
@@ -257,15 +316,25 @@ int main(int argc, char** argv) {
         }
         auto t0 = std::chrono::steady_clock::now();
         uint64_t done = 0;
+        const char* benv = ::getenv("STRATA_C8_B");
+        const bool do_repack = (benv != nullptr && benv[0] == '1');
         for (const auto& h : held) {
-            const uint8_t* b = src.blob_stable(h.l, h.e);
-            if (b == nullptr) {
-                std::fprintf(stderr, "p40_daemon: [%s] pack read failed at (%d,%d)\n", timestamp().c_str(), h.l, h.e);
+            const uint8_t* srcb = src.blob_stable(h.l, h.e);
+            if (srcb == nullptr) {
+                std::fprintf(stderr, "p40d: [%s] pack read failed at (%d,%d)\n", timestamp().c_str(), h.l, h.e);
                 return 1;
+            }
+            std::vector<uint8_t> hostbuf;
+            const uint8_t* b = srcb;
+            if (do_repack && repack_layer_enabled(h.l)) {
+                hostbuf.assign(srcb, srcb + h.bytes);
+                repack_down_iq4nl_to_q4_0(hostbuf.data(), pl, h.l);
+                b = hostbuf.data();
+                std::fprintf(stderr, "p40d: [repack] layer %d expert %d IQ4_NL -> Q4_0 down\n", h.l, h.e);
             }
             if (::cudaMemcpy((uint8_t*) dev + h.off, b, (size_t) h.bytes, cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
-                std::fprintf(stderr, "p40_daemon: [%s] H2D fill failed: %s\n", timestamp().c_str(),
+                std::fprintf(stderr, "p40d: [%s] H2D fill failed: %s\n", timestamp().c_str(),
                              ::cudaGetErrorString(::cudaGetLastError()));
                 return 1;
             }
@@ -458,6 +527,10 @@ int main(int argc, char** argv) {
             // CUDA failure -> false (caller breaks: stream stays synced, the
             // engine falls back to GETs). MISS legs drain via engine discipline.
             auto serve_compute = [&](const std::vector<uint8_t>& rq) -> bool {
+                const bool t9_timing = t9_on("STRATA_T9_TIMING");
+                const bool t9_fp16 = t9_on("STRATA_T9_FP16");
+                const double t9_call0 = t9_timing ? t9_us() : 0.0;
+                double t9_kernel_us = -1, t9_cast_us = -1, t9_d2h_us = 0, t9_sock_us = 0;
                 // v2: native_expert_grouped (native IQ layouts) + q8_1 input.
                 // Req: {u32 n, u32 layer, u32 n_embd, u32 n_ff, u32 gu, u32 d,
                 //   n x (u64 l, u64 e; l must == layer), q8_1 act ((n_embd/32)*36 B)}.
@@ -506,6 +579,8 @@ int main(int argc, char** argv) {
                 }
                 static cudaStream_t cs = nullptr;
                 static uint8_t *xq_d = nullptr, *out_d = nullptr;
+                static __half *out_h_d = nullptr;
+                static cudaEvent_t t9_ev0 = nullptr, t9_ev1 = nullptr, t9_ev2 = nullptr, t9_ev3 = nullptr;
                 static unsigned long long* gp_d = nullptr;
                 static int32_t *gs_d = nullptr, *ng_d = nullptr, *ed_d = nullptr, *et_d = nullptr;
                 static void* scratch = nullptr; static size_t scratch_n = 0;
@@ -513,6 +588,7 @@ int main(int argc, char** argv) {
                     if (::cudaStreamCreate(&cs) != cudaSuccess) return false;
                     if (::cudaMalloc(&xq_d, (size_t)(8192 / 32) * 36) != cudaSuccess) return false;
                     if (::cudaMalloc(&out_d, (size_t)64 * (size_t)8192 * 4) != cudaSuccess) return false;
+                    if (::cudaMalloc(&out_h_d, (size_t)64 * (size_t)8192 * 2) != cudaSuccess) return false;
                     if (::cudaMalloc(&gp_d, (size_t)64 * 8) != cudaSuccess) return false;
                     if (::cudaMalloc(&gs_d, (size_t)65 * 4) != cudaSuccess) return false;
                     if (::cudaMalloc(&ng_d, (size_t)4) != cudaSuccess) return false;
@@ -542,22 +618,50 @@ int main(int argc, char** argv) {
                     ed[m] = (int32_t)m; ++m;
                 }
                 if (m > 0) {
-                    int32_t gs[2] = {0, (int32_t)m}, ng = 1;
-                    if (::cudaMemcpyAsync(gp_d, gp.data(), m * 8, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
-                    if (::cudaMemcpyAsync(gs_d, gs, 8, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
-                    if (::cudaMemcpyAsync(ng_d, &ng, 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    // D0: one group per expert. grp_ptr[k]=expert k addr, grp_start[k..k+1)=[k,k+1),
+                    // n_groups = single int32 m (dereferenced by kernel), ent_dst/ent_tok = per-entry.
+                    std::vector<unsigned long long> gp2(m);
+                    std::vector<int32_t> gs2(m + 1), ng2(1, (int32_t)m);
+                    for (int32_t k = 0; k < m; ++k) { gp2[k] = gp[k]; gs2[k] = k; }
+                    gs2[m] = m;
+                    if (::cudaMemcpyAsync(gp_d, gp2.data(), m * 8, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(gs_d, gs2.data(), (m + 1) * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (::cudaMemcpyAsync(ng_d, ng2.data(), 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
                     if (::cudaMemcpyAsync(ed_d, ed.data(), m * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
                     if (::cudaMemcpyAsync(et_d, et.data(), m * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+                    if (t9_timing) {
+                        if (!t9_ev0) {
+                            ::cudaEventCreate(&t9_ev0); ::cudaEventCreate(&t9_ev1);
+                            ::cudaEventCreate(&t9_ev2); ::cudaEventCreate(&t9_ev3);
+                        }
+                        ::cudaEventRecord(t9_ev0, cs);
+                    }
                     strata::kernels::native_expert_grouped(
-                        L, gp_d, gs_d, ng_d, ed_d, et_d, 1, (int64_t)m, xq_d, scratch,
+                        L, gp_d, gs_d, ng_d, ed_d, et_d, (int64_t)m, (int64_t)m, xq_d, scratch,
                         (float*)out_d, (void*)cs, 0);
-                    if (::cudaGetLastError() != cudaSuccess) return false;
-                    if (::cudaStreamSynchronize(cs) != cudaSuccess) return false;
+                    if (t9_timing) ::cudaEventRecord(t9_ev1, cs);
+                    if (t9_fp16) {
+                        if (t9_timing) ::cudaEventRecord(t9_ev2, cs);
+                        p40_f32_to_f16((const float*)out_d, out_h_d, (int)(m * (size_t)n_embd), cs);
+                        if (t9_timing) ::cudaEventRecord(t9_ev3, cs);
+                    }
                 }
-                std::vector<uint8_t> outh(n * (size_t)n_embd * 4, 0);
+                const size_t t9_fb = (size_t)n_embd * (t9_fp16 ? 2 : 4);
+                std::vector<uint8_t> outh(n * t9_fb, 0);
+                if (t9_timing && m > 0) {
+                    float ms = 0; ::cudaEventSynchronize(t9_ev1);
+                    ::cudaEventElapsedTime(&ms, t9_ev0, t9_ev1); t9_kernel_us = ms * 1000.0;
+                    if (t9_fp16) {
+                        float ms2 = 0; ::cudaEventSynchronize(t9_ev3);
+                        ::cudaEventElapsedTime(&ms2, t9_ev2, t9_ev3); t9_cast_us = ms2 * 1000.0;
+                    }
+                }
+                double t9_d2h0 = t9_timing ? t9_us() : 0.0;
                 if (m > 0 &&
-                    ::cudaMemcpy(outh.data(), out_d, m * (size_t)n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+                    ::cudaMemcpy(outh.data(), t9_fp16 ? (void*)out_h_d : (void*)out_d, m * t9_fb,
+                                 cudaMemcpyDeviceToHost) != cudaSuccess)
                     return false;
+                if (t9_timing) t9_d2h_us = t9_us() - t9_d2h0;
                 for (size_t k = 0, r = 0; k < n; ++k) {
                     if (is_miss[k]) {
                         ++misses;
@@ -568,11 +672,11 @@ int main(int argc, char** argv) {
                     }
                     ++gets; ++hits;
                     std::vector<uint8_t> fr;
-                    fr.reserve(16 + (size_t)n_embd * 4);
+                    fr.reserve(16 + t9_fb);
                     for (int b = 0; b < 8; ++b) fr.push_back(((uint8_t*)&rl[k])[b]);
                     for (int b = 0; b < 8; ++b) fr.push_back(((uint8_t*)&re[k])[b]);
-                    fr.insert(fr.end(), outh.data() + r * (size_t)n_embd * 4,
-                              outh.data() + (r + 1) * (size_t)n_embd * 4);
+                    fr.insert(fr.end(), outh.data() + r * t9_fb,
+                              outh.data() + (r + 1) * t9_fb);
                     ++r;
                     if (trace && trace_n < 200) {
                         std::fprintf(stderr, "p40d: [%s] COMPUTE (%lld,%lld) -> %llu B out\n",
@@ -580,8 +684,13 @@ int main(int argc, char** argv) {
                                      (unsigned long long)((size_t)n_embd * 4));
                         ++trace_n;
                     }
+                    double t9_s0 = t9_timing ? t9_us() : 0.0;
                     if (!send_frame(fd, (uint32_t)pw::COMPUTE_REPLY, fr.data(), fr.size())) return false;
+                    if (t9_timing) t9_sock_us += t9_us() - t9_s0;
                 }
+                if (t9_timing) std::fprintf(stderr,
+                    "T9 n=%u m=%zu kernel_us=%.1f cast_us=%.1f d2h_us=%.1f sock_us=%.1f total_us=%.1f\n",
+                    n, m, t9_kernel_us, t9_cast_us, t9_d2h_us, t9_sock_us, t9_us() - t9_call0);
                 return true;
             };
             if (op == pw::GET) {
